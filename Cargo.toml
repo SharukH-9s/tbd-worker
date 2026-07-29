@@ -1,0 +1,36 @@
+[package]
+name = "tbd-worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# AMQP client for consuming from CloudAMQP (RabbitMQ)
+lapin = "2"
+
+# HTTP client for calling Resend (email) and Gotenberg (PDF)
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# UUID for idempotency tracking
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Postgres client for idempotency (processed_jobs table on Neon)
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "uuid", "macros"] }
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Error handling
+anyhow = "1"
+
+# Environment variable loading
+dotenvy = "0.15"
+futures = "0.3.33"
