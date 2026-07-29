@@ -1,4 +1,5 @@
 use crate::config::WorkerConfig;
+use crate::error::ConsumerError;
 use futures::StreamExt;
 use lapin::{
     options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions},
@@ -129,12 +130,34 @@ pub async fn consume_pdf_jobs(channel: Channel, config: WorkerConfig) {
                 // TODO: upload pdf_bytes to S3 / storage before ACKing
                 let _ = delivery.ack(BasicAckOptions::default()).await;
             }
-            Err(e) => {
+            Err(ConsumerError::Permanent(msg)) => {
+                tracing::error!(
+                    booking_id = payload.booking_id,
+                    error = %msg,
+                    "PDF consumer: permanent generation failure — NACKing WITHOUT requeue (discarding)"
+                );
+                // delete from processed_jobs so that it can be retried (if we wanted to, but we are discarding it anyway, so deleting it keeps the db clean)
+                let _ = sqlx::query!(
+                    "DELETE FROM processed_jobs WHERE outbox_id = $1 AND consumer = 'pdf'",
+                    payload.outbox_id
+                )
+                .execute(&config.db)
+                .await;
+
+                let _ = delivery
+                    .nack(BasicNackOptions {
+                        requeue: false,
+                        ..Default::default()
+                    })
+                    .await;
+            }
+            Err(ConsumerError::Transient(e)) => {
                 tracing::error!(
                     booking_id = payload.booking_id,
                     error = %e,
-                    "PDF consumer: PDF generation failed — NACKing with requeue"
+                    "PDF consumer: transient generation failure — NACKing WITH requeue"
                 );
+                // delete from processed_jobs so that it can be retried
                 let _ = sqlx::query!(
                     "DELETE FROM processed_jobs WHERE outbox_id = $1 AND consumer = 'pdf'",
                     payload.outbox_id
@@ -158,7 +181,7 @@ pub async fn consume_pdf_jobs(channel: Channel, config: WorkerConfig) {
 async fn generate_invoice_pdf(
     config: &WorkerConfig,
     payload: &InvoiceRequestedPayload,
-) -> anyhow::Result<Vec<u8>> {
+) -> Result<Vec<u8>, ConsumerError> {
     // HTML template for the invoice — Gotenberg renders this to PDF
     let html = format!(
         r#"<!DOCTYPE html>
@@ -179,7 +202,8 @@ async fn generate_invoice_pdf(
         "files",
         reqwest::multipart::Part::bytes(html.into_bytes())
             .file_name("index.html")
-            .mime_str("text/html")?,
+            .mime_str("text/html")
+            .map_err(|e| ConsumerError::Transient(e.into()))?,
     );
 
     let response = config
@@ -190,14 +214,33 @@ async fn generate_invoice_pdf(
         ))
         .multipart(form)
         .send()
-        .await?;
+        .await
+        .map_err(|e| ConsumerError::Transient(e.into()))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        anyhow::bail!("Gotenberg error: {} — {}", status, text); // the function will return Err, which will cause the consumer to NACK the message with requeue. so we don't need to ack or nack here manually
+        
+        // 4xx client errors (except 429) are permanent — retrying won't help
+        if status.is_client_error() && status.as_u16() != 429 {
+            return Err(ConsumerError::Permanent(format!(
+                "Gotenberg permanent error: {} — {}",
+                status, text
+            )));
+        }
+
+        // 5xx server errors or 429 (rate limit) are transient — retry
+        return Err(ConsumerError::Transient(anyhow::anyhow!(
+            "Gotenberg transient error: {} — {}",
+            status, text
+        )));
     }
 
-    let pdf_bytes = response.bytes().await?.to_vec();
+    let pdf_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| ConsumerError::Transient(e.into()))?
+        .to_vec();
+        
     Ok(pdf_bytes)
 }

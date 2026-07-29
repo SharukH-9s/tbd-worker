@@ -1,4 +1,5 @@
 use crate::config::WorkerConfig;
+use crate::error::ConsumerError;
 use futures::StreamExt;
 use lapin::{
     options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions},
@@ -133,11 +134,33 @@ pub async fn consume_email_jobs(channel: Channel, config: WorkerConfig) {
                 );
                 let _ = delivery.ack(BasicAckOptions::default()).await; // RabbitMQ receives the ACK and permanently deletes the job from the queue.
             }
-            Err(e) => {
+            Err(ConsumerError::Permanent(msg)) => {
+                tracing::error!(
+                    booking_id = payload.booking_id,
+                    error = %msg,
+                    "Email consumer: permanent send failure — NACKing WITHOUT requeue (discarding)"
+                );
+                // delete from processed_jobs so that it can be retried (if we wanted to, but we are discarding it anyway, so deleting it keeps the db clean)
+                let _ = sqlx::query!(
+                    "DELETE FROM processed_jobs WHERE outbox_id = $1 AND consumer = 'email'",
+                    payload.outbox_id
+                )
+                .execute(&config.db)
+                .await;
+
+                // Permanent error — discard
+                let _ = delivery
+                    .nack(BasicNackOptions {
+                        requeue: false,
+                        ..Default::default()
+                    })
+                    .await; 
+            }
+            Err(ConsumerError::Transient(e)) => {
                 tracing::error!(
                     booking_id = payload.booking_id,
                     error = %e,
-                    "Email consumer: failed to send email — NACKing with requeue"
+                    "Email consumer: transient send failure — NACKing WITH requeue"
                 );
                 // delete from processed_jobs so that it can be retried
                 let _ = sqlx::query!(
@@ -164,9 +187,9 @@ pub async fn consume_email_jobs(channel: Channel, config: WorkerConfig) {
 async fn send_booking_email(
     config: &WorkerConfig,
     payload: &BookingCreatedPayload,
-) -> anyhow::Result<()> {
+) -> Result<(), ConsumerError> {
     let body = serde_json::json!({
-        "from": "TBD <no-reply@yourdomain.com>",
+        "from": "TBD <onboarding@resend.dev>",
         "to": [payload.user_email],
         "subject": format!("Booking Confirmed — {}", payload.slot_start),
         "html": format!(
@@ -182,12 +205,26 @@ async fn send_booking_email(
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
-        .await?;
+        .await
+        .map_err(|e| ConsumerError::Transient(e.into()))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        anyhow::bail!("Resend API error: {} — {}", status, text); // the function will return Err, which will cause the consumer to NACK the message with requeue. so we don't need to ack or nack here manually
+        
+        // 4xx client errors (except 429) are permanent — retrying won't help
+        if status.is_client_error() && status.as_u16() != 429 {
+            return Err(ConsumerError::Permanent(format!(
+                "Resend API permanent error: {} — {}",
+                status, text
+            )));
+        }
+
+        // 5xx server errors or 429 (rate limit) are transient — retry
+        return Err(ConsumerError::Transient(anyhow::anyhow!(
+            "Resend API transient error: {} — {}",
+            status, text
+        )));
     }
 
     Ok(())

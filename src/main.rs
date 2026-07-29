@@ -1,5 +1,6 @@
 mod config;
 mod consumers;
+pub mod error;
 
 use dotenvy::dotenv;
 use std::env;
