@@ -38,6 +38,24 @@ async fn main() {
 
     tracing::info!(env = %app_env, "tbd-worker starting up");
 
+    // ── Health Check Server (Render Free Tier Workaround) ─────────────────────
+    let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+        Ok(listener) => {
+            tracing::info!(port = %port, "Health check server bound successfully");
+            tokio::spawn(async move {
+                let app = axum::Router::new().route("/healthz", axum::routing::get(|| async { "OK" }));
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::error!(error = %e, "Health check server failed to run");
+                }
+            });
+        }
+        Err(e) => {
+            tracing::error!(port = %port, error = %e, "Failed to bind health check server");
+        }
+    }
+
+
     // ── Read Required Config ──────────────────────────────────────────────────
 
     let amqp_url = env::var("AMQP_URL").expect("AMQP_URL must be set");
