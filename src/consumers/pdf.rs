@@ -208,10 +208,8 @@ async fn generate_invoice_pdf(
 
     let response = config
         .http_client
-        .post(format!(
-            "{}/forms/chromium/convert/html",
-            config.gotenberg_url
-        ))
+        .post("https://gotenberg-8-atxh.onrender.com/forms/chromium/convert/html")
+        .basic_auth("admin", Some("your_strong_secret_password"))
         .multipart(form)
         .send()
         .await
@@ -220,7 +218,7 @@ async fn generate_invoice_pdf(
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        
+
         // 4xx client errors (except 429) are permanent — retrying won't help
         if status.is_client_error() && status.as_u16() != 429 {
             return Err(ConsumerError::Permanent(format!(
@@ -232,7 +230,8 @@ async fn generate_invoice_pdf(
         // 5xx server errors or 429 (rate limit) are transient — retry
         return Err(ConsumerError::Transient(anyhow::anyhow!(
             "Gotenberg transient error: {} — {}",
-            status, text
+            status,
+            text
         )));
     }
 
@@ -241,6 +240,6 @@ async fn generate_invoice_pdf(
         .await
         .map_err(|e| ConsumerError::Transient(e.into()))?
         .to_vec();
-        
+
     Ok(pdf_bytes)
 }
