@@ -154,7 +154,7 @@ pub async fn consume_email_jobs(channel: Channel, config: WorkerConfig) {
                         requeue: false,
                         ..Default::default()
                     })
-                    .await; 
+                    .await;
             }
             Err(ConsumerError::Transient(e)) => {
                 tracing::error!(
@@ -211,7 +211,7 @@ async fn send_booking_email(
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        
+
         // 4xx client errors (except 429) are permanent — retrying won't help
         if status.is_client_error() && status.as_u16() != 429 {
             return Err(ConsumerError::Permanent(format!(
@@ -223,7 +223,8 @@ async fn send_booking_email(
         // 5xx server errors or 429 (rate limit) are transient — retry
         return Err(ConsumerError::Transient(anyhow::anyhow!(
             "Resend API transient error: {} — {}",
-            status, text
+            status,
+            text
         )));
     }
 
