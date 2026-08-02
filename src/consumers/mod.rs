@@ -1,5 +1,4 @@
-pub mod email;
-pub mod pdf;
+pub mod booking;
 
 use crate::config::WorkerConfig;
 use lapin::{Connection, ConnectionProperties};
@@ -23,19 +22,11 @@ async fn connect_and_subscribe(config: WorkerConfig) -> Result<(), lapin::Error>
     let conn = Connection::connect(&config.amqp_url, ConnectionProperties::default()).await?;
     tracing::info!("Worker: connected to CloudAMQP");
 
-    // Each consumer gets its own AMQP channel.
-    // Channels are lightweight and independent — a failure on one does not affect the other.
-    let email_channel = conn.create_channel().await?;
-    let pdf_channel = conn.create_channel().await?;
+    let booking_channel = conn.create_channel().await?;
 
-    tracing::info!("Worker: starting consumers on 'email_jobs' and 'pdf_jobs'");
+    tracing::info!("Worker: starting consumer on 'booking_jobs'");
 
-    // Spawn both consumers concurrently and wait for either to exit.
-    // tokio::join! runs both futures in parallel on the same task.
-    tokio::join!(
-        email::consume_email_jobs(email_channel, config.clone()),
-        pdf::consume_pdf_jobs(pdf_channel, config.clone()),
-    );
+    tokio::spawn(booking::consume_booking_jobs(booking_channel, config.clone())).await.unwrap();
 
     Ok(())
 }

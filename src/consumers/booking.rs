@@ -1,5 +1,6 @@
 use crate::config::WorkerConfig;
 use crate::error::ConsumerError;
+use base64::{engine::general_purpose, Engine as _};
 use futures::StreamExt;
 use lapin::{
     options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions},
@@ -9,31 +10,30 @@ use lapin::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-const QUEUE_NAME: &str = "pdf_jobs";
+const QUEUE_NAME: &str = "booking_jobs";
 
-/// Payload shape expected from the 'InvoiceRequested' outbox event.
+/// Unified payload shape expected from the 'BookingCreated' outbox event.
 #[derive(Debug, Deserialize)]
-struct InvoiceRequestedPayload {
+struct BookingCreatedPayload {
     outbox_id: Uuid, // used for idempotency — matches the outbox row's UUID
     booking_id: i64,
-    #[allow(dead_code)]
-    // present in the fanout payload for the email consumer; PDF does not use it
     user_email: String,
     contact_name: String,
+    slot_start: String,
     amount: String,
 }
 
-/// Subscribe to 'pdf_jobs' and process each message with manual ACK.
-pub async fn consume_pdf_jobs(channel: Channel, config: WorkerConfig) {
+/// Subscribe to 'booking_jobs' and process each message with manual ACK.
+pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
     if let Err(e) = channel.basic_qos(1, BasicQosOptions::default()).await {
-        tracing::error!(error = %e, "PDF consumer: failed to set QoS");
+        tracing::error!(error = %e, "Booking consumer: failed to set QoS");
         return;
     }
 
     let mut consumer = match channel
         .basic_consume(
             QUEUE_NAME,
-            "tbd-worker-pdf", // consumer tag
+            "tbd-worker-booking", // consumer tag
             BasicConsumeOptions {
                 no_ack: false, // Manual ACK
                 ..Default::default()
@@ -44,26 +44,26 @@ pub async fn consume_pdf_jobs(channel: Channel, config: WorkerConfig) {
     {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = %e, "PDF consumer: failed to start consuming");
+            tracing::error!(error = %e, "Booking consumer: failed to start consuming");
             return;
         }
     };
 
-    tracing::info!("PDF consumer: listening on '{}'", QUEUE_NAME);
+    tracing::info!("Booking consumer: listening on '{}'", QUEUE_NAME);
 
     while let Some(delivery_result) = consumer.next().await {
         let delivery = match delivery_result {
             Ok(d) => d,
             Err(e) => {
-                tracing::error!(error = %e, "PDF consumer: delivery error");
+                tracing::error!(error = %e, "Booking consumer: delivery error");
                 break;
             }
         };
 
-        let payload: InvoiceRequestedPayload = match serde_json::from_slice(&delivery.data) {
+        let payload: BookingCreatedPayload = match serde_json::from_slice(&delivery.data) {
             Ok(p) => p,
             Err(e) => {
-                tracing::error!(error = %e, "PDF consumer: invalid JSON payload — NACKing without requeue");
+                tracing::error!(error = %e, "Booking consumer: invalid JSON payload — NACKing without requeue");
                 let _ = delivery
                     .nack(BasicNackOptions {
                         requeue: false,
@@ -76,15 +76,14 @@ pub async fn consume_pdf_jobs(channel: Channel, config: WorkerConfig) {
 
         tracing::info!(
             booking_id = payload.booking_id,
-            "PDF consumer: generating invoice PDF via Gotenberg"
+            email = %payload.user_email,
+            "Booking consumer: processing booking job"
         );
 
         // ── Idempotency check ─────────────────────────────────────────────────
-        // Composite PK (outbox_id, 'pdf') is independent from the email consumer's
-        // (outbox_id, 'email') claim — both can proceed from the same outbox message.
         let claimed = sqlx::query!(
             "INSERT INTO processed_jobs (outbox_id, consumer)
-             VALUES ($1, 'pdf')
+             VALUES ($1, 'booking')
              ON CONFLICT DO NOTHING
              RETURNING outbox_id",
             payload.outbox_id
@@ -96,7 +95,7 @@ pub async fn consume_pdf_jobs(channel: Channel, config: WorkerConfig) {
             Ok(None) => {
                 tracing::warn!(
                     outbox_id = %payload.outbox_id,
-                    "PDF consumer: duplicate delivery detected — ACKing and skipping"
+                    "Booking consumer: duplicate delivery detected — ACKing and skipping"
                 );
                 let _ = delivery.ack(BasicAckOptions::default()).await;
                 continue;
@@ -105,7 +104,7 @@ pub async fn consume_pdf_jobs(channel: Channel, config: WorkerConfig) {
                 tracing::error!(
                     outbox_id = %payload.outbox_id,
                     error = %e,
-                    "PDF consumer: failed to claim job in processed_jobs — NACKing with requeue"
+                    "Booking consumer: failed to claim job in processed_jobs — NACKing with requeue"
                 );
                 let _ = delivery
                     .nack(BasicNackOptions {
@@ -116,29 +115,26 @@ pub async fn consume_pdf_jobs(channel: Channel, config: WorkerConfig) {
                 continue;
             }
             Ok(Some(_)) => {
-                // We hold the exclusive claim — proceed with PDF generation.
+                // We hold the exclusive claim — proceed.
             }
         }
 
-        match generate_invoice_pdf(&config, &payload).await {
-            Ok(pdf_bytes) => {
+        match process_booking_job(&config, &payload).await {
+            Ok(_) => {
                 tracing::info!(
                     booking_id = payload.booking_id,
-                    size_bytes = pdf_bytes.len(),
-                    "PDF consumer: PDF generated — ACKing"
+                    "Booking consumer: PDF generated and email sent — ACKing"
                 );
-                // TODO: upload pdf_bytes to S3 / storage before ACKing
                 let _ = delivery.ack(BasicAckOptions::default()).await;
             }
             Err(ConsumerError::Permanent(msg)) => {
                 tracing::error!(
                     booking_id = payload.booking_id,
                     error = %msg,
-                    "PDF consumer: permanent generation failure — NACKing WITHOUT requeue (discarding)"
+                    "Booking consumer: permanent failure — NACKing WITHOUT requeue (discarding)"
                 );
-                // delete from processed_jobs so that it can be retried (if we wanted to, but we are discarding it anyway, so deleting it keeps the db clean)
                 let _ = sqlx::query!(
-                    "DELETE FROM processed_jobs WHERE outbox_id = $1 AND consumer = 'pdf'",
+                    "DELETE FROM processed_jobs WHERE outbox_id = $1 AND consumer = 'booking'",
                     payload.outbox_id
                 )
                 .execute(&config.db)
@@ -155,11 +151,10 @@ pub async fn consume_pdf_jobs(channel: Channel, config: WorkerConfig) {
                 tracing::error!(
                     booking_id = payload.booking_id,
                     error = %e,
-                    "PDF consumer: transient generation failure — NACKing WITH requeue"
+                    "Booking consumer: transient failure — NACKing WITH requeue"
                 );
-                // delete from processed_jobs so that it can be retried
                 let _ = sqlx::query!(
-                    "DELETE FROM processed_jobs WHERE outbox_id = $1 AND consumer = 'pdf'",
+                    "DELETE FROM processed_jobs WHERE outbox_id = $1 AND consumer = 'booking'",
                     payload.outbox_id
                 )
                 .execute(&config.db)
@@ -175,14 +170,29 @@ pub async fn consume_pdf_jobs(channel: Channel, config: WorkerConfig) {
         }
     }
 
-    tracing::warn!("PDF consumer: stream ended — exiting");
+    tracing::warn!("Booking consumer: stream ended — exiting");
+}
+
+async fn process_booking_job(
+    config: &WorkerConfig,
+    payload: &BookingCreatedPayload,
+) -> Result<(), ConsumerError> {
+    // 1. Generate PDF bytes via Gotenberg
+    let pdf_bytes = generate_invoice_pdf(config, payload).await?;
+    
+    // 2. Base64-encode the PDF bytes
+    let pdf_base64 = general_purpose::STANDARD.encode(&pdf_bytes);
+
+    // 3. Send the email with the attached PDF
+    send_booking_email(config, payload, pdf_base64).await?;
+
+    Ok(())
 }
 
 async fn generate_invoice_pdf(
     config: &WorkerConfig,
-    payload: &InvoiceRequestedPayload,
+    payload: &BookingCreatedPayload,
 ) -> Result<Vec<u8>, ConsumerError> {
-    // HTML template for the invoice — Gotenberg renders this to PDF
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -197,7 +207,6 @@ async fn generate_invoice_pdf(
         payload.booking_id, payload.contact_name, payload.booking_id, payload.amount
     );
 
-    // Gotenberg's /forms/chromium/convert/html endpoint accepts multipart/form-data
     let form = reqwest::multipart::Form::new().part(
         "files",
         reqwest::multipart::Part::bytes(html.into_bytes())
@@ -208,7 +217,7 @@ async fn generate_invoice_pdf(
 
     let response = config
         .http_client
-        .post("https://gotenberg-8-atxh.onrender.com/forms/chromium/convert/html")
+        .post(&format!("{}/forms/chromium/convert/html", config.gotenberg_url))
         .basic_auth("admin", Some("your_strong_secret_password"))
         .multipart(form)
         .send()
@@ -219,7 +228,6 @@ async fn generate_invoice_pdf(
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
 
-        // 4xx client errors (except 429) are permanent — retrying won't help
         if status.is_client_error() && status.as_u16() != 429 {
             return Err(ConsumerError::Permanent(format!(
                 "Gotenberg permanent error: {} — {}",
@@ -227,11 +235,9 @@ async fn generate_invoice_pdf(
             )));
         }
 
-        // 5xx server errors or 429 (rate limit) are transient — retry
         return Err(ConsumerError::Transient(anyhow::anyhow!(
             "Gotenberg transient error: {} — {}",
-            status,
-            text
+            status, text
         )));
     }
 
@@ -242,4 +248,55 @@ async fn generate_invoice_pdf(
         .to_vec();
 
     Ok(pdf_bytes)
+}
+
+async fn send_booking_email(
+    config: &WorkerConfig,
+    payload: &BookingCreatedPayload,
+    pdf_base64: String,
+) -> Result<(), ConsumerError> {
+    let body = serde_json::json!({
+        "from": "TBD <onboarding@resend.dev>",
+        "to": [payload.user_email],
+        "subject": format!("Booking Confirmed — {}", payload.slot_start),
+        "html": format!(
+            "<p>Hi {},</p><p>Your booking (#{}) is confirmed for <strong>{}</strong>.</p><p>Please find your invoice attached.</p>",
+            payload.contact_name, payload.booking_id, payload.slot_start
+        ),
+        "attachments": [
+            {
+                "filename": format!("invoice-{}.pdf", payload.booking_id),
+                "content": pdf_base64
+            }
+        ]
+    });
+
+    let response = config
+        .http_client
+        .post("https://api.resend.com/emails")
+        .header("Authorization", format!("Bearer {}", config.resend_api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ConsumerError::Transient(e.into()))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+
+        if status.is_client_error() && status.as_u16() != 429 {
+            return Err(ConsumerError::Permanent(format!(
+                "Resend API permanent error: {} — {}",
+                status, text
+            )));
+        }
+
+        return Err(ConsumerError::Transient(anyhow::anyhow!(
+            "Resend API transient error: {} — {}",
+            status, text
+        )));
+    }
+
+    Ok(())
 }
