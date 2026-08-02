@@ -58,14 +58,26 @@ async fn main() {
 
 
     // ── Read Required Config ──────────────────────────────────────────────────
+    let amqp_url = env::var("AMQP_URL")
+        .expect("AMQP_URL must be set")
+        .trim()
+        .to_string();
 
-    let amqp_url = env::var("AMQP_URL").expect("AMQP_URL must be set");
+    let resend_api_key = env::var("RESEND_API_KEY")
+        .expect("RESEND_API_KEY must be set")
+        .trim()
+        .to_string();
 
-    let resend_api_key = env::var("RESEND_API_KEY").expect("RESEND_API_KEY must be set");
+    let gotenberg_url = env::var("GOTENBERG_URL")
+        .expect("GOTENBERG_URL must be set")
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
 
-    let gotenberg_url = env::var("GOTENBERG_URL").expect("GOTENBERG_URL must be set");
-
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let database_url = env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set")
+        .trim()
+        .to_string();
 
     // ── Connect to Neon (Postgres) ────────────────────────────────────────────
     // PgPool manages a pool of async connections. It is cheap to clone — all clones

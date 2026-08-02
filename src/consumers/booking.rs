@@ -150,7 +150,7 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
             Err(ConsumerError::Transient(e)) => {
                 tracing::error!(
                     booking_id = payload.booking_id,
-                    error = %e,
+                    error = ?e,
                     "Booking consumer: transient failure — NACKing WITH requeue"
                 );
                 let _ = sqlx::query!(
