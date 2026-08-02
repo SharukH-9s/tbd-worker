@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO processed_jobs (outbox_id, consumer)\n             VALUES ($1, 'pdf')\n             ON CONFLICT DO NOTHING\n             RETURNING outbox_id",
+  "query": "INSERT INTO processed_jobs (outbox_id, consumer)\n             VALUES ($1, 'booking')\n             ON CONFLICT DO NOTHING\n             RETURNING outbox_id",
   "describe": {
     "columns": [
       {
@@ -18,5 +18,5 @@
       false
     ]
   },
-  "hash": "76dfaeda2c98c41acead4cf01f5c42262485a498e4218caf36f7d85396c4045b"
+  "hash": "66ceb9de08e741b4c1df833a9d3f300e47a3b157ba77ee5e3618f09c7627839d"
 }

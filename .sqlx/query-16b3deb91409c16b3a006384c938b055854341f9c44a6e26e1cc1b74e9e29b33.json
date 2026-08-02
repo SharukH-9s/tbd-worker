@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM processed_jobs WHERE outbox_id = $1 AND consumer = 'booking'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "16b3deb91409c16b3a006384c938b055854341f9c44a6e26e1cc1b74e9e29b33"
+}
