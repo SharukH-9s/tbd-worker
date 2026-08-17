@@ -179,7 +179,7 @@ async fn process_booking_job(
 ) -> Result<(), ConsumerError> {
     // 1. Generate PDF bytes via Gotenberg
     let pdf_bytes = generate_invoice_pdf(config, payload).await?;
-    
+
     // 2. Base64-encode the PDF bytes
     let pdf_base64 = general_purpose::STANDARD.encode(&pdf_bytes);
 
@@ -217,16 +217,29 @@ async fn generate_invoice_pdf(
 
     let response = config
         .http_client
-        .post(&format!("{}/forms/chromium/convert/html", config.gotenberg_url))
+        .post(&format!(
+            "{}/forms/chromium/convert/html",
+            config.gotenberg_url
+        ))
         .basic_auth("admin", Some("your_strong_secret_password"))
         .multipart(form)
         .send()
         .await
         .map_err(|e| ConsumerError::Transient(e.into()))?;
 
+    // gottenberg erro handling
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
+        let text = if text.len() > 300 {
+            format!(
+                "{}... [truncated, total {} bytes]",
+                &text[..300],
+                text.len()
+            )
+        } else {
+            text
+        };
 
         if status.is_client_error() && status.as_u16() != 429 {
             return Err(ConsumerError::Permanent(format!(
@@ -237,7 +250,8 @@ async fn generate_invoice_pdf(
 
         return Err(ConsumerError::Transient(anyhow::anyhow!(
             "Gotenberg transient error: {} — {}",
-            status, text
+            status,
+            text
         )));
     }
 
@@ -284,6 +298,15 @@ async fn send_booking_email(
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
+        let text = if text.len() > 300 {
+            format!(
+                "{}... [truncated, total {} bytes]",
+                &text[..300],
+                text.len()
+            )
+        } else {
+            text
+        };
 
         if status.is_client_error() && status.as_u16() != 429 {
             return Err(ConsumerError::Permanent(format!(
@@ -294,7 +317,8 @@ async fn send_booking_email(
 
         return Err(ConsumerError::Transient(anyhow::anyhow!(
             "Resend API transient error: {} — {}",
-            status, text
+            status,
+            text
         )));
     }
 
