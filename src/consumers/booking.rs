@@ -25,7 +25,7 @@ struct BookingCreatedPayload {
 
 /// Subscribe to 'booking_jobs' and process each message with manual ACK.
 pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
-    if let Err(e) = channel.basic_qos(1, BasicQosOptions::default()).await {
+    if let Err(e) = channel.basic_qos(config.amqp_prefetch_count, BasicQosOptions::default()).await {
         tracing::error!(error = %e, "Booking consumer: failed to set QoS");
         return;
     }
@@ -215,14 +215,21 @@ async fn generate_invoice_pdf(
             .map_err(|e| ConsumerError::Transient(e.into()))?,
     );
 
-    let response = config
+    let mut request = config
         .http_client
-        .post(&format!(
+        .post(format!(
             "{}/forms/chromium/convert/html",
             config.gotenberg_url
         ))
-        .basic_auth("admin", Some("your_strong_secret_password"))
-        .multipart(form)
+        .multipart(form);
+
+    // Only attach Basic Auth if credentials are configured.
+    // Leave unset if your Gotenberg instance has no auth (avoids proxy 401/502).
+    if let (Some(user), Some(pass)) = (&config.gotenberg_user, &config.gotenberg_password) {
+        request = request.basic_auth(user, Some(pass));
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|e| ConsumerError::Transient(e.into()))?;
@@ -270,7 +277,7 @@ async fn send_booking_email(
     pdf_base64: String,
 ) -> Result<(), ConsumerError> {
     let body = serde_json::json!({
-        "from": "TBD <onboarding@resend.dev>",
+        "from": config.resend_from_email.as_str(),
         "to": [payload.user_email],
         "subject": format!("Booking Confirmed — {}", payload.slot_start),
         "html": format!(

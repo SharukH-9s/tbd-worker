@@ -26,7 +26,7 @@ async fn connect_and_subscribe(config: WorkerConfig) -> Result<(), lapin::Error>
 
     tracing::info!("Worker: starting consumer on 'booking_jobs'");
 
-    tokio::spawn(booking::consume_booking_jobs(booking_channel, config.clone())).await.unwrap();
+    booking::consume_booking_jobs(booking_channel, config).await;
 
     Ok(())
 }

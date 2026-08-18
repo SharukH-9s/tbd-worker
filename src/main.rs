@@ -57,7 +57,7 @@ async fn main() {
     }
 
 
-    // ── Read Required Config ──────────────────────────────────────────────────
+    // ── Read Required Config ───────────────────────────────────────────────
     let amqp_url = env::var("AMQP_URL")
         .expect("AMQP_URL must be set")
         .trim()
@@ -79,27 +79,50 @@ async fn main() {
         .trim()
         .to_string();
 
-    // ── Connect to Neon (Postgres) ────────────────────────────────────────────
-    // PgPool manages a pool of async connections. It is cheap to clone — all clones
-    // share the same underlying pool. Used exclusively for processed_jobs idempotency checks.
-    let db = sqlx::PgPool::connect(&database_url)
+    // ── Read Optional / Tunable Config ────────────────────────────────────
+    let resend_from_email = env::var("RESEND_FROM_EMAIL")
+        .unwrap_or_else(|_| "TBD <onboarding@resend.dev>".to_string());
+
+    let gotenberg_user = env::var("GOTENBERG_USER").ok();
+    let gotenberg_password = env::var("GOTENBERG_PASSWORD").ok();
+
+    let amqp_prefetch_count: u16 = env::var("AMQP_PREFETCH_COUNT")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+
+    let http_timeout_secs: u64 = env::var("HTTP_TIMEOUT_SECS")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+
+    let max_connections: u32 = env::var("DATABASE_MAX_CONNECTIONS")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+
+    let acquire_timeout_secs: u64 = env::var("DATABASE_ACQUIRE_TIMEOUT_SECS")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+
+    // ── Connect to Neon (Postgres) with Pool Tuning ───────────────────────
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs))
+        .connect(&database_url)
         .await
         .expect("Failed to connect to Neon (DATABASE_URL)");
 
     tracing::info!("tbd-worker: connected to Neon (Postgres)");
 
-    // ── Build Shared HTTP Client ──────────────────────────────────────────────
-    // A single reqwest client is cheaply cloneable across consumer tasks.
+    // ── Build Shared HTTP Client ───────────────────────────────────────────
     let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(http_timeout_secs))
         .build()
         .expect("Failed to build HTTP client");
 
-    // ── Build Config ──────────────────────────────────────────────────────────
+    // ── Build Config ───────────────────────────────────────────────────────
     let worker_config = config::WorkerConfig {
         amqp_url,
+        amqp_prefetch_count,
         resend_api_key,
+        resend_from_email,
         gotenberg_url,
+        gotenberg_user,
+        gotenberg_password,
         http_client,
         db,
     };
