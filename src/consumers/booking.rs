@@ -25,7 +25,10 @@ struct BookingCreatedPayload {
 
 /// Subscribe to 'booking_jobs' and process each message with manual ACK.
 pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
-    if let Err(e) = channel.basic_qos(config.amqp_prefetch_count, BasicQosOptions::default()).await {
+    if let Err(e) = channel
+        .basic_qos(config.amqp_prefetch_count, BasicQosOptions::default())
+        .await
+    {
         tracing::error!(error = %e, "Booking consumer: failed to set QoS");
         return;
     }
@@ -119,7 +122,40 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
             }
         }
 
-        match process_booking_job(&config, &payload).await {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempts = 0;
+
+        let process_result = loop {
+            attempts += 1;
+            match process_booking_job(&config, &payload).await {
+                Ok(()) => break Ok(()),
+                Err(ConsumerError::Permanent(msg)) => {
+                    break Err(ConsumerError::Permanent(msg));
+                }
+                Err(ConsumerError::Transient(e)) => {
+                    if attempts >= MAX_ATTEMPTS {
+                        tracing::error!(
+                            booking_id = payload.booking_id,
+                            attempts,
+                            error = ?e,
+                            "Booking consumer: max retries reached — moving to DLQ"
+                        );
+                        break Err(ConsumerError::Transient(e));
+                    }
+                    let backoff = std::time::Duration::from_secs(2u64.pow(attempts));
+                    tracing::warn!(
+                        booking_id = payload.booking_id,
+                        attempt = attempts,
+                        retry_in_secs = backoff.as_secs(),
+                        error = ?e,
+                        "Booking consumer: transient failure — retrying after backoff"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        };
+
+        match process_result {
             Ok(_) => {
                 tracing::info!(
                     booking_id = payload.booking_id,
@@ -127,32 +163,13 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
                 );
                 let _ = delivery.ack(BasicAckOptions::default()).await;
             }
-            Err(ConsumerError::Permanent(msg)) => {
-                tracing::error!(
-                    booking_id = payload.booking_id,
-                    error = %msg,
-                    "Booking consumer: permanent failure — NACKing WITHOUT requeue (discarding)"
-                );
-                let _ = sqlx::query!(
-                    "DELETE FROM processed_jobs WHERE outbox_id = $1 AND consumer = 'booking'",
-                    payload.outbox_id
-                )
-                .execute(&config.db)
-                .await;
-
-                let _ = delivery
-                    .nack(BasicNackOptions {
-                        requeue: false,
-                        ..Default::default()
-                    })
-                    .await;
-            }
-            Err(ConsumerError::Transient(e)) => {
+            Err(e) => {
                 tracing::error!(
                     booking_id = payload.booking_id,
                     error = ?e,
-                    "Booking consumer: transient failure — NACKing WITH requeue"
+                    "Booking consumer: failure — NACKing WITHOUT requeue (routing to DLQ)"
                 );
+
                 let _ = sqlx::query!(
                     "DELETE FROM processed_jobs WHERE outbox_id = $1 AND consumer = 'booking'",
                     payload.outbox_id
@@ -162,7 +179,7 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
 
                 let _ = delivery
                     .nack(BasicNackOptions {
-                        requeue: true,
+                        requeue: false, // Ensures failed messages go to `tbd.dlx` and `tbd.dlq` safely
                         ..Default::default()
                     })
                     .await;
