@@ -3,24 +3,112 @@ use crate::error::ConsumerError;
 use base64::{engine::general_purpose, Engine as _};
 use futures::StreamExt;
 use lapin::{
-    options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions},
-    types::FieldTable,
-    Channel,
+    options::{
+        BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions,
+        ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions,
+    },
+    types::{AMQPValue, FieldTable},
+    Channel, ExchangeKind,
 };
 use serde::Deserialize;
 use uuid::Uuid;
 
 const QUEUE_NAME: &str = "booking_jobs";
+const EXCHANGE_NAME: &str = "tbd.events";
 
-/// Unified payload shape expected from the 'BookingCreated' outbox event.
+/// Standard event envelope published by the outbox relay.
 #[derive(Debug, Deserialize)]
-struct BookingCreatedPayload {
-    outbox_id: Uuid, // used for idempotency — matches the outbox row's UUID
-    booking_id: i64,
-    user_email: String,
-    contact_name: String,
-    slot_start: String,
-    amount: String,
+#[allow(dead_code)]
+pub struct EventEnvelope<T> {
+    pub id: Uuid,                  // Matches outbox.id (used for idempotency)
+    pub event_type: String,        // e.g. "BookingCreated"
+    pub timestamp: Option<String>, // ISO 8601 string
+    pub payload: T,                // Domain payload data
+}
+
+/// Domain payload shape for 'BookingCreated' event.
+#[derive(Debug, Deserialize)]
+pub struct BookingCreatedData {
+    pub booking_id: i64,
+    pub user_email: String,
+    pub contact_name: String,
+    pub slot_start: String,
+    pub amount: String,
+}
+
+/// Ensure RabbitMQ topology (DLX, DLQ, Topic Exchange, Queue) exists idempotently before consuming.
+async fn setup_booking_topology(ch: &Channel) -> Result<(), lapin::Error> {
+    // 1. Declare DLX (Fanout)
+    ch.exchange_declare(
+        "tbd.dlx",
+        ExchangeKind::Fanout,
+        ExchangeDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        FieldTable::default(),
+    )
+    .await?;
+
+    // 2. Declare DLQ and bind to DLX
+    ch.queue_declare(
+        "tbd.dlq",
+        QueueDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        FieldTable::default(),
+    )
+    .await?;
+    ch.queue_bind(
+        "tbd.dlq",
+        "tbd.dlx",
+        "",
+        QueueBindOptions::default(),
+        FieldTable::default(),
+    )
+    .await?;
+
+    // 3. Declare Main Topic Exchange
+    ch.exchange_declare(
+        EXCHANGE_NAME,
+        ExchangeKind::Topic,
+        ExchangeDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        FieldTable::default(),
+    )
+    .await?;
+
+    // 4. Declare booking_jobs queue with DLX
+    let mut booking_args = FieldTable::default();
+    booking_args.insert(
+        "x-dead-letter-exchange".into(),
+        AMQPValue::LongString("tbd.dlx".into()),
+    );
+
+    ch.queue_declare(
+        QUEUE_NAME,
+        QueueDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        booking_args,
+    )
+    .await?;
+
+    // 5. Bind booking_jobs to receive all booking.* events
+    ch.queue_bind(
+        QUEUE_NAME,
+        EXCHANGE_NAME,
+        "booking.#",
+        QueueBindOptions::default(),
+        FieldTable::default(),
+    )
+    .await?;
+
+    Ok(())
 }
 
 /// Subscribe to 'booking_jobs' and process each message with manual ACK.
@@ -30,6 +118,12 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
         .await
     {
         tracing::error!(error = %e, "Booking consumer: failed to set QoS");
+        return;
+    }
+
+    // Ensure exchange and queue topology are declared idempotently
+    if let Err(e) = setup_booking_topology(&channel).await {
+        tracing::error!(error = %e, "Booking consumer: failed to declare AMQP topology");
         return;
     }
 
@@ -63,10 +157,13 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
             }
         };
 
-        let payload: BookingCreatedPayload = match serde_json::from_slice(&delivery.data) {
-            Ok(p) => p,
+        // Deserialize standardized EventEnvelope
+        let envelope: EventEnvelope<BookingCreatedData> = match serde_json::from_slice(
+            &delivery.data,
+        ) {
+            Ok(env) => env,
             Err(e) => {
-                tracing::error!(error = %e, "Booking consumer: invalid JSON payload — NACKing without requeue");
+                tracing::error!(error = %e, "Booking consumer: invalid JSON envelope — NACKing without requeue");
                 let _ = delivery
                     .nack(BasicNackOptions {
                         requeue: false,
@@ -78,36 +175,34 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
         };
 
         tracing::info!(
-            booking_id = payload.booking_id,
-            email = %payload.user_email,
+            outbox_id = %envelope.id,
+            booking_id = envelope.payload.booking_id,
+            email = %envelope.payload.user_email,
             "Booking consumer: processing booking job"
         );
 
-        // ── Idempotency check ─────────────────────────────────────────────────
-        let claimed = sqlx::query!(
-            "INSERT INTO processed_jobs (outbox_id, consumer)
-             VALUES ($1, 'booking')
-             ON CONFLICT DO NOTHING
-             RETURNING outbox_id",
-            payload.outbox_id
+        // ── Idempotency Pre-Check ─────────────────────────────────────────────
+        let already_processed = sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM processed_jobs WHERE outbox_id = $1 AND consumer = 'booking'",
         )
+        .bind(envelope.id)
         .fetch_optional(&config.db)
         .await;
 
-        match claimed {
-            Ok(None) => {
+        match already_processed {
+            Ok(Some(_)) => {
                 tracing::warn!(
-                    outbox_id = %payload.outbox_id,
-                    "Booking consumer: duplicate delivery detected — ACKing and skipping"
+                    outbox_id = %envelope.id,
+                    "Booking consumer: duplicate delivery detected (already completed) — ACKing and skipping"
                 );
                 let _ = delivery.ack(BasicAckOptions::default()).await;
                 continue;
             }
             Err(e) => {
                 tracing::error!(
-                    outbox_id = %payload.outbox_id,
+                    outbox_id = %envelope.id,
                     error = %e,
-                    "Booking consumer: failed to claim job in processed_jobs — NACKing with requeue"
+                    "Booking consumer: failed to check processed_jobs table — NACKing with requeue"
                 );
                 let _ = delivery
                     .nack(BasicNackOptions {
@@ -117,17 +212,18 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
                     .await;
                 continue;
             }
-            Ok(Some(_)) => {
-                // We hold the exclusive claim — proceed.
+            Ok(None) => {
+                // Not yet processed — proceed to execute
             }
         }
 
+        // ── Execute with retry & backoff ──────────────────────────────────────
         const MAX_ATTEMPTS: u32 = 3;
         let mut attempts = 0;
 
         let process_result = loop {
             attempts += 1;
-            match process_booking_job(&config, &payload).await {
+            match process_booking_job(&config, &envelope.payload).await {
                 Ok(()) => break Ok(()),
                 Err(ConsumerError::Permanent(msg)) => {
                     break Err(ConsumerError::Permanent(msg));
@@ -135,7 +231,7 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
                 Err(ConsumerError::Transient(e)) => {
                     if attempts >= MAX_ATTEMPTS {
                         tracing::error!(
-                            booking_id = payload.booking_id,
+                            booking_id = envelope.payload.booking_id,
                             attempts,
                             error = ?e,
                             "Booking consumer: max retries reached — moving to DLQ"
@@ -144,7 +240,7 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
                     }
                     let backoff = std::time::Duration::from_secs(2u64.pow(attempts));
                     tracing::warn!(
-                        booking_id = payload.booking_id,
+                        booking_id = envelope.payload.booking_id,
                         attempt = attempts,
                         retry_in_secs = backoff.as_secs(),
                         error = ?e,
@@ -155,31 +251,44 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
             }
         };
 
+        // ── Record Idempotency on Completion & ACK/NACK ───────────────────────
         match process_result {
             Ok(_) => {
+                // Record into processed_jobs upon successful completion
+                let insert_result = sqlx::query(
+                    "INSERT INTO processed_jobs (outbox_id, consumer)
+                     VALUES ($1, 'booking')
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(envelope.id)
+                .execute(&config.db)
+                .await;
+
+                if let Err(e) = insert_result {
+                    tracing::error!(
+                        outbox_id = %envelope.id,
+                        error = %e,
+                        "Booking consumer: warning — failed to record into processed_jobs"
+                    );
+                }
+
                 tracing::info!(
-                    booking_id = payload.booking_id,
+                    booking_id = envelope.payload.booking_id,
                     "Booking consumer: PDF generated and email sent — ACKing"
                 );
                 let _ = delivery.ack(BasicAckOptions::default()).await;
             }
             Err(e) => {
                 tracing::error!(
-                    booking_id = payload.booking_id,
+                    booking_id = envelope.payload.booking_id,
                     error = ?e,
                     "Booking consumer: failure — NACKing WITHOUT requeue (routing to DLQ)"
                 );
 
-                let _ = sqlx::query!(
-                    "DELETE FROM processed_jobs WHERE outbox_id = $1 AND consumer = 'booking'",
-                    payload.outbox_id
-                )
-                .execute(&config.db)
-                .await;
-
+                // Requeue: false sends message to tbd.dlx / tbd.dlq
                 let _ = delivery
                     .nack(BasicNackOptions {
-                        requeue: false, // Ensures failed messages go to `tbd.dlx` and `tbd.dlq` safely
+                        requeue: false,
                         ..Default::default()
                     })
                     .await;
@@ -192,7 +301,7 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
 
 async fn process_booking_job(
     config: &WorkerConfig,
-    payload: &BookingCreatedPayload,
+    payload: &BookingCreatedData,
 ) -> Result<(), ConsumerError> {
     // 1. Generate PDF bytes via Gotenberg
     let pdf_bytes = generate_invoice_pdf(config, payload).await?;
@@ -208,7 +317,7 @@ async fn process_booking_job(
 
 async fn generate_invoice_pdf(
     config: &WorkerConfig,
-    payload: &BookingCreatedPayload,
+    payload: &BookingCreatedData,
 ) -> Result<Vec<u8>, ConsumerError> {
     let html = format!(
         r#"<!DOCTYPE html>
@@ -251,7 +360,7 @@ async fn generate_invoice_pdf(
         .await
         .map_err(|e| ConsumerError::Transient(e.into()))?;
 
-    // gottenberg erro handling
+    // Gotenberg error handling
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
@@ -290,7 +399,7 @@ async fn generate_invoice_pdf(
 
 async fn send_booking_email(
     config: &WorkerConfig,
-    payload: &BookingCreatedPayload,
+    payload: &BookingCreatedData,
     pdf_base64: String,
 ) -> Result<(), ConsumerError> {
     let body = serde_json::json!({
