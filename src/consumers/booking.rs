@@ -268,8 +268,22 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
                     tracing::error!(
                         outbox_id = %envelope.id,
                         error = %e,
-                        "Booking consumer: warning — failed to record into processed_jobs"
+                        "Booking consumer: failed to record into processed_jobs — NACKing with requeue"
                     );
+                    if let Err(nack_error) = delivery
+                        .nack(BasicNackOptions {
+                            requeue: true,
+                            ..Default::default()
+                        })
+                        .await
+                    {
+                        tracing::error!(
+                            outbox_id = %envelope.id,
+                            error = %nack_error,
+                            "Booking consumer: failed to NACK after completion record error"
+                        );
+                    }
+                    continue;
                 }
 
                 tracing::info!(
