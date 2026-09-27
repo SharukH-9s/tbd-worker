@@ -31,9 +31,63 @@ pub struct EventEnvelope<T> {
 pub struct BookingCreatedData {
     pub booking_id: i64,
     pub user_email: String,
-    pub contact_name: String,
+    pub contact_name: Option<String>,
+    #[serde(default)]
+    pub turf_name: Option<String>,
+    #[serde(default)]
+    pub game_name: Option<String>,
     pub slot_start: String,
     pub amount: String,
+    #[serde(default)]
+    pub total_price: Option<String>,
+    #[serde(default)]
+    pub paid_amount: Option<String>,
+    #[serde(default)]
+    pub due_amount: Option<String>,
+    #[serde(default)]
+    pub payment_status: Option<String>,
+}
+
+impl BookingCreatedData {
+    pub fn display_contact_name(&self) -> &str {
+        self.contact_name.as_deref().unwrap_or("Customer")
+    }
+
+    pub fn display_turf_name(&self) -> &str {
+        self.turf_name.as_deref().unwrap_or("Turf BD Arena")
+    }
+
+    pub fn display_game_name(&self) -> &str {
+        self.game_name.as_deref().unwrap_or("Pitch Reservation")
+    }
+
+    pub fn display_payment_status(&self) -> &str {
+        match self.payment_status.as_deref() {
+            Some("Fully_Paid") | Some("FullyPaid") => "Fully Paid",
+            Some("Partially_Paid") | Some("PartiallyPaid") => "Partially Paid (Advance)",
+            Some(other) => other,
+            None => "Paid",
+        }
+    }
+
+    pub fn is_partially_paid(&self) -> bool {
+        matches!(
+            self.payment_status.as_deref(),
+            Some("Partially_Paid") | Some("PartiallyPaid")
+        )
+    }
+
+    pub fn display_total_price(&self) -> &str {
+        self.total_price.as_deref().unwrap_or(&self.amount)
+    }
+
+    pub fn display_paid_amount(&self) -> &str {
+        self.paid_amount.as_deref().unwrap_or(&self.amount)
+    }
+
+    pub fn display_due_amount(&self) -> &str {
+        self.due_amount.as_deref().unwrap_or("0")
+    }
 }
 
 /// Ensure RabbitMQ topology (DLX, DLQ, Topic Exchange, Queue) exists idempotently before consuming.
@@ -333,18 +387,272 @@ async fn generate_invoice_pdf(
     config: &WorkerConfig,
     payload: &BookingCreatedData,
 ) -> Result<Vec<u8>, ConsumerError> {
+    let status_badge_class = if payload.is_partially_paid() {
+        "status-partial"
+    } else {
+        "status-paid"
+    };
+
+    let due_section = if payload.is_partially_paid() {
+        format!(
+            r#"<tr class="due-row">
+                <td colspan="2"><strong>Amount Due at Venue</strong></td>
+                <td class="text-right text-due"><strong>BDT {}</strong></td>
+            </tr>"#,
+            payload.display_due_amount()
+        )
+    } else {
+        String::new()
+    };
+
+    let payment_note = if payload.is_partially_paid() {
+        format!(
+            r#"<div class="notice-card warning">
+                <strong>⚠️ Advance Payment Acknowledged:</strong> BDT {} paid online. Please settle the remaining balance of <strong>BDT {}</strong> at the venue desk prior to match kickoff.
+            </div>"#,
+            payload.display_paid_amount(),
+            payload.display_due_amount()
+        )
+    } else {
+        r#"<div class="notice-card success">
+            <strong>✅ Paid in Full:</strong> This reservation has been completely settled online. Please present this invoice at the venue for direct entry.
+        </div>"#.to_string()
+    };
+
     let html = format!(
         r#"<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>Invoice #{}</title></head>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Invoice #{}</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: #1e293b;
+      background-color: #ffffff;
+      padding: 40px;
+      font-size: 14px;
+      line-height: 1.5;
+    }}
+    .invoice-card {{
+      max-width: 680px;
+      margin: 0 auto;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 36px;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+    }}
+    .header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      border-bottom: 2px solid #0f172a;
+      padding-bottom: 20px;
+      margin-bottom: 24px;
+    }}
+    .brand {{
+      font-size: 26px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      color: #0f172a;
+    }}
+    .brand span {{ color: #10b981; }}
+    .invoice-title {{
+      text-align: right;
+    }}
+    .invoice-title h2 {{
+      font-size: 20px;
+      color: #334155;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }}
+    .invoice-title p {{
+      color: #64748b;
+      font-size: 13px;
+    }}
+    .grid-info {{
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 24px;
+      gap: 20px;
+    }}
+    .info-block h4 {{
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #64748b;
+      margin-bottom: 6px;
+    }}
+    .info-block p {{
+      font-size: 14px;
+      font-weight: 600;
+      color: #1e293b;
+    }}
+    .info-block span {{
+      color: #475569;
+      font-weight: 400;
+      display: block;
+    }}
+    .badge {{
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }}
+    .status-paid {{
+      background-color: #ecfdf5;
+      color: #059669;
+      border: 1px solid #a7f3d0;
+    }}
+    .status-partial {{
+      background-color: #fffbeb;
+      color: #d97706;
+      border: 1px solid #fde68a;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 24px;
+    }}
+    th {{
+      background-color: #f8fafc;
+      color: #475569;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      text-align: left;
+      padding: 12px 14px;
+      border-top: 1px solid #e2e8f0;
+      border-bottom: 1px solid #e2e8f0;
+    }}
+    td {{
+      padding: 14px;
+      border-bottom: 1px solid #f1f5f9;
+      color: #334155;
+    }}
+    .text-right {{ text-align: right; }}
+    .text-due {{ color: #dc2626; }}
+    .text-paid {{ color: #059669; }}
+    .total-row td {{
+      font-weight: 700;
+      background-color: #f8fafc;
+      border-top: 2px solid #e2e8f0;
+    }}
+    .due-row td {{
+      background-color: #fef2f2;
+      border-top: 1px solid #fecaca;
+    }}
+    .notice-card {{
+      padding: 14px 18px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 24px;
+      line-height: 1.6;
+    }}
+    .notice-card.warning {{
+      background-color: #fffbeb;
+      border: 1px solid #fef3c7;
+      color: #92400e;
+    }}
+    .notice-card.success {{
+      background-color: #ecfdf5;
+      border: 1px solid #d1fae5;
+      color: #065f46;
+    }}
+    .footer {{
+      border-top: 1px solid #e2e8f0;
+      padding-top: 18px;
+      text-align: center;
+      color: #94a3b8;
+      font-size: 12px;
+    }}
+  </style>
+</head>
 <body>
-  <h1>TBD — Invoice</h1>
-  <p>Client: <strong>{}</strong></p>
-  <p>Booking ID: <strong>{}</strong></p>
-  <p>Amount: <strong>BDT {}</strong></p>
+  <div class="invoice-card">
+    <div class="header">
+      <div class="brand">TURF<span>BD</span></div>
+      <div class="invoice-title">
+        <h2>Tax Invoice</h2>
+        <p>Booking #{}</p>
+      </div>
+    </div>
+
+    <div class="grid-info">
+      <div class="info-block">
+        <h4>Customer Details</h4>
+        <p>{}</p>
+        <span>{}</span>
+      </div>
+      <div class="info-block">
+        <h4>Venue & Pitch</h4>
+        <p>{}</p>
+        <span>{}</span>
+      </div>
+      <div class="info-block text-right">
+        <h4>Match Schedule</h4>
+        <p>{}</p>
+        <span style="margin-top: 6px;"><span class="badge {}">{}</span></span>
+      </div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Description</th>
+          <th>Rate / Unit</th>
+          <th class="text-right">Amount</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            <strong>Slot Reservation</strong><br>
+            <span style="color: #64748b; font-size: 12px;">{} &bull; {}</span>
+          </td>
+          <td>1 Match Slot</td>
+          <td class="text-right">BDT {}</td>
+        </tr>
+        <tr class="total-row">
+          <td colspan="2"><strong>Total Slot Price</strong></td>
+          <td class="text-right"><strong>BDT {}</strong></td>
+        </tr>
+        <tr>
+          <td colspan="2"><span class="text-paid">Amount Paid Online</span></td>
+          <td class="text-right text-paid"><strong>BDT {}</strong></td>
+        </tr>
+        {}
+      </tbody>
+    </table>
+
+    {}
+
+    <div class="footer">
+      Thank you for playing with Turf BD &bull; For questions, contact support@turfbd.com
+    </div>
+  </div>
 </body>
 </html>"#,
-        payload.booking_id, payload.contact_name, payload.booking_id, payload.amount
+        payload.booking_id,
+        payload.booking_id,
+        payload.display_contact_name(),
+        payload.user_email,
+        payload.display_turf_name(),
+        payload.display_game_name(),
+        payload.slot_start,
+        status_badge_class,
+        payload.display_payment_status(),
+        payload.display_turf_name(),
+        payload.display_game_name(),
+        payload.display_total_price(),
+        payload.display_total_price(),
+        payload.display_paid_amount(),
+        due_section,
+        payment_note
     );
 
     let form = reqwest::multipart::Form::new().part(
@@ -416,14 +724,76 @@ async fn send_booking_email(
     payload: &BookingCreatedData,
     pdf_base64: String,
 ) -> Result<(), ConsumerError> {
+    let subject = format!(
+        "Booking Confirmed #{} — {} ({})",
+        payload.booking_id,
+        payload.display_turf_name(),
+        payload.display_game_name()
+    );
+
+    let payment_summary = if payload.is_partially_paid() {
+        format!(
+            r#"<div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 14px; margin: 16px 0;">
+                <p style="margin: 0; color: #92400e; font-weight: bold;">⚠️ Advance Payment Confirmed</p>
+                <p style="margin: 6px 0 0 0; color: #b45309; font-size: 14px;">
+                    Amount Paid: <strong>BDT {}</strong><br />
+                    Amount Due at Turf: <strong style="color: #dc2626;">BDT {}</strong>
+                </p>
+            </div>"#,
+            payload.display_paid_amount(),
+            payload.display_due_amount()
+        )
+    } else {
+        format!(
+            r#"<div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 14px; margin: 16px 0;">
+                <p style="margin: 0; color: #065f46; font-weight: bold;">✅ Payment Complete</p>
+                <p style="margin: 6px 0 0 0; color: #047857; font-size: 14px;">Total Paid: <strong>BDT {}</strong> (Fully Paid)</p>
+            </div>"#,
+            payload.display_paid_amount()
+        )
+    };
+
+    let html_content = format!(
+        r#"<!DOCTYPE html>
+<html>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #1e293b; line-height: 1.6; max-width: 600px; margin: 0 auto; padding: 20px;">
+    <h2 style="color: #0f172a; margin-bottom: 8px;">Your Booking is Confirmed!</h2>
+    <p>Hi <strong>{}</strong>,</p>
+    <p>Great news! Your slot reservation has been successfully confirmed.</p>
+    
+    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin: 16px 0;">
+        <p style="margin: 0 0 8px 0;"><strong>Booking ID:</strong> #{}</p>
+        <p style="margin: 0 0 8px 0;"><strong>Venue:</strong> {}</p>
+        <p style="margin: 0 0 8px 0;"><strong>Pitch / Game:</strong> {}</p>
+        <p style="margin: 0;"><strong>Match Schedule:</strong> {}</p>
+    </div>
+
+    {}
+
+    <p style="color: #475569; font-size: 14px;">
+        Your official tax invoice has been generated and attached as a PDF (<strong>invoice-{}.pdf</strong>).
+    </p>
+    
+    <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;" />
+    <p style="font-size: 12px; color: #94a3b8; text-align: center;">
+        Turf BD &bull; Instant Sports Booking
+    </p>
+</body>
+</html>"#,
+        payload.display_contact_name(),
+        payload.booking_id,
+        payload.display_turf_name(),
+        payload.display_game_name(),
+        payload.slot_start,
+        payment_summary,
+        payload.booking_id
+    );
+
     let body = serde_json::json!({
         "from": config.resend_from_email.as_str(),
         "to": [payload.user_email],
-        "subject": format!("Booking Confirmed — {}", payload.slot_start),
-        "html": format!(
-            "<p>Hi {},</p><p>Your booking (#{}) is confirmed for <strong>{}</strong>.</p><p>Please find your invoice attached.</p>",
-            payload.contact_name, payload.booking_id, payload.slot_start
-        ),
+        "subject": subject,
+        "html": html_content,
         "attachments": [
             {
                 "filename": format!("invoice-{}.pdf", payload.booking_id),
