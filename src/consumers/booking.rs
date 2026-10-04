@@ -1,6 +1,7 @@
 use crate::config::WorkerConfig;
 use crate::error::ConsumerError;
 use askama::Template;
+use base64::{engine::general_purpose, Engine as _};
 use derive_typst_intoval::{IntoDict, IntoValue};
 use futures::StreamExt;
 use lapin::{
@@ -10,10 +11,6 @@ use lapin::{
     },
     types::{AMQPValue, FieldTable},
     Channel, ExchangeKind,
-};
-use lettre::{
-    message::{header::ContentType, Attachment, MultiPart, SinglePart},
-    AsyncTransport, Message,
 };
 use serde::Deserialize;
 use typst::foundations::{Dict, IntoValue as _};
@@ -522,19 +519,19 @@ fn render_email_html(payload: &BookingCreatedData) -> Result<String, ConsumerErr
         .map_err(|e| ConsumerError::Permanent(format!("Askama template render error: {}", e)))
 }
 
-// ── Email Sending (Lettre → Brevo SMTP) ──────────────────────────────────────
+// ── Email Sending (Brevo HTTP API) ───────────────────────────────────────────
 
-/// Builds a MIME multipart email (HTML body + PDF attachment) and sends it
-/// via Lettre through the pre-configured Brevo SMTP transport.
+/// Dispatches the confirmation email with the Typst-generated PDF invoice
+/// attached via Brevo's transactional email REST API (v3).
 ///
-/// No base64 encoding needed — Lettre handles binary attachment encoding internally.
+/// Brevo API endpoint: POST https://api.brevo.com/v3/smtp/email
+/// Uses HTTP port 443 — guaranteed open on all cloud platforms (including Render free tier).
 async fn send_booking_email(
     config: &WorkerConfig,
     payload: &BookingCreatedData,
     html_body: String,
     pdf_bytes: Vec<u8>,
 ) -> Result<(), ConsumerError> {
-    // Subject line
     let subject = format!(
         "Booking Confirmed #{} — {} ({})",
         payload.booking_id,
@@ -542,72 +539,67 @@ async fn send_booking_email(
         payload.display_game_name()
     );
 
-    // PDF attachment — Lettre accepts raw bytes directly, no base64 needed
+    let pdf_base64 = general_purpose::STANDARD.encode(&pdf_bytes);
     let attachment_filename = format!("invoice-{}.pdf", payload.booking_id);
-    let pdf_content_type = ContentType::parse("application/pdf").unwrap();
-    let attachment = Attachment::new(attachment_filename).body(pdf_bytes, pdf_content_type);
 
-    // Parse RFC 5321 From/To mailboxes
-    let from_addr = config
-        .email_from
-        .parse::<lettre::message::Mailbox>()
-        .map_err(|e| {
-            ConsumerError::Permanent(format!(
-                "Invalid FROM address '{}': {}",
-                config.email_from, e
-            ))
-        })?;
+    let (from_name, from_email) = split_display_email(&config.email_from);
 
-    let to_addr = payload
-        .user_email
-        .parse::<lettre::message::Mailbox>()
-        .map_err(|e| {
-            ConsumerError::Permanent(format!(
-                "Invalid TO address '{}': {}",
-                payload.user_email, e
-            ))
-        })?;
+    let body = serde_json::json!({
+        "sender": { "name": from_name, "email": from_email },
+        "to": [{ "email": payload.user_email, "name": payload.display_contact_name() }],
+        "subject": subject,
+        "htmlContent": html_body,
+        "attachment": [{ "name": attachment_filename, "content": pdf_base64 }],
+    });
 
-    // Build MIME message:
-    //   multipart/mixed
-    //     └── text/html        ← rendered by Askama
-    //     └── application/pdf  ← invoice rendered by Typst
-    let email = Message::builder()
-        .from(from_addr)
-        .to(to_addr)
-        .subject(subject)
-        .multipart(
-            MultiPart::mixed()
-                .singlepart(
-                    SinglePart::builder()
-                        .header(ContentType::TEXT_HTML)
-                        .body(html_body),
-                )
-                .singlepart(attachment),
-        )
-        .map_err(|e| ConsumerError::Permanent(format!("Failed to build MIME message: {}", e)))?;
+    let response = config
+        .http_client
+        .post("https://api.brevo.com/v3/smtp/email")
+        .header("api-key", &config.brevo_api_key)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ConsumerError::Transient(e.into()))?;
 
-    // Send via Brevo SMTP using the pre-built Lettre transport
-    config.mailer.send(email).await.map_err(|e| {
-        let msg = e.to_string();
-        // SMTP 5xx auth / mailbox errors won't fix on retry → Permanent
-        // Connection drops, 421 (service unavailable), timeouts → Transient
-        if msg.contains("535")
-            || msg.contains("550")
-            || msg.contains("553")
-            || msg.to_lowercase().contains("authentication")
-        {
-            ConsumerError::Permanent(format!("SMTP permanent error: {}", msg))
-        } else {
-            ConsumerError::Transient(anyhow::anyhow!("SMTP transient error: {}", msg))
-        }
-    })?;
+    let status = response.status();
 
-    tracing::info!(
-        booking_id = payload.booking_id,
-        recipient = %payload.user_email,
-        "Booking consumer: confirmation email dispatched via Brevo SMTP"
-    );
+    if status.is_success() {
+        tracing::info!(
+            booking_id = payload.booking_id,
+            recipient = %payload.user_email,
+            "Booking consumer: confirmation email dispatched via Brevo API"
+        );
+        return Ok(());
+    }
 
-    Ok(())
+    let err_text = response.text().await.unwrap_or_default();
+    let err_text = if err_text.len() > 300 {
+        format!("{}... [truncated]", &err_text[..300])
+    } else {
+        err_text
+    };
+
+    if status.is_client_error() && status.as_u16() != 429 {
+        return Err(ConsumerError::Permanent(format!(
+            "Brevo API permanent error {}: {}",
+            status, err_text
+        )));
+    }
+
+    Err(ConsumerError::Transient(anyhow::anyhow!(
+        "Brevo API transient error {}: {}",
+        status,
+        err_text
+    )))
+}
+
+fn split_display_email(s: &str) -> (String, String) {
+    if let (Some(lt), Some(gt)) = (s.find('<'), s.find('>')) {
+        let name = s[..lt].trim().to_string();
+        let email = s[lt + 1..gt].trim().to_string();
+        (name, email)
+    } else {
+        (s.to_string(), s.to_string())
+    }
 }

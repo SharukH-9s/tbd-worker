@@ -3,7 +3,6 @@ mod consumers;
 pub mod error;
 
 use dotenvy::dotenv;
-use lettre::{transport::smtp::authentication::Credentials, AsyncSmtpTransport, Tokio1Executor};
 use std::env;
 
 #[tokio::main]
@@ -12,8 +11,6 @@ async fn main() {
     dotenv().ok();
 
     // ── Tracing Setup ─────────────────────────────────────────────────────────
-    // EnvFilter reads RUST_LOG at runtime (defaults to "info" if not set).
-
     let (non_blocking_writer, _guard) = tracing_appender::non_blocking(std::io::stdout());
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -68,25 +65,12 @@ async fn main() {
         .trim()
         .to_string();
 
-    let brevo_smtp_user = env::var("BREVO_SMTP_USER")
-        .expect("BREVO_SMTP_USER must be set")
-        .trim()
-        .to_string();
-
-    let brevo_smtp_password = env::var("BREVO_SMTP_PASSWORD")
-        .expect("BREVO_SMTP_PASSWORD must be set")
+    let brevo_api_key = env::var("BREVO_API_KEY")
+        .expect("BREVO_API_KEY must be set")
         .trim()
         .to_string();
 
     // ── Optional / Tunable Config ──────────────────────────────────────────────
-    let brevo_smtp_host =
-        env::var("BREVO_SMTP_HOST").unwrap_or_else(|_| "smtp-relay.brevo.com".to_string());
-
-    let brevo_smtp_port: u16 = env::var("BREVO_SMTP_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(587);
-
     let email_from =
         env::var("EMAIL_FROM").unwrap_or_else(|_| "Turf BD <no-reply@turfbd.com>".to_string());
 
@@ -105,6 +89,11 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
 
+    let http_timeout_secs: u64 = env::var("HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
     // ── Connect to Neon (Postgres) ─────────────────────────────────────────────
     let db = sqlx::postgres::PgPoolOptions::new()
         .max_connections(max_connections)
@@ -115,41 +104,26 @@ async fn main() {
 
     tracing::info!("tbd-worker: connected to Neon (Postgres)");
 
-    // ── Build Lettre SMTP Transport (Brevo) ────────────────────────────────────
-    // Uses STARTTLS on port 587. The transport wraps an Arc internally,
-    // so cloning WorkerConfig is cheap — no new connection is opened.
-    let creds = Credentials::new(brevo_smtp_user.clone(), brevo_smtp_password.clone());
+    // ── Build Shared HTTP Client (for Brevo API) ──────────────────────────────
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(http_timeout_secs))
+        .build()
+        .expect("Failed to build HTTP client");
 
-    let mailer: AsyncSmtpTransport<Tokio1Executor> =
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&brevo_smtp_host)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failed to build SMTP transport for '{}': {}",
-                    brevo_smtp_host, e
-                )
-            })
-            .port(brevo_smtp_port)
-            .credentials(creds)
-            .build();
-
-    tracing::info!(
-        smtp_host = %brevo_smtp_host,
-        smtp_port = brevo_smtp_port,
-        "tbd-worker: Lettre SMTP transport configured (Brevo)"
-    );
+    tracing::info!("tbd-worker: Brevo HTTP API configured (port 443)");
 
     // ── Build Shared Config ────────────────────────────────────────────────────
     let worker_config = config::WorkerConfig {
         amqp_url,
         amqp_prefetch_count,
+        brevo_api_key,
         email_from,
-        mailer,
+        http_client,
         db,
     };
 
     tracing::info!("tbd-worker config loaded — connecting to CloudAMQP...");
 
     // ── Start Consumer Loop ────────────────────────────────────────────────────
-    // This runs forever, reconnecting on drop.
     consumers::run_consumers(worker_config).await;
 }

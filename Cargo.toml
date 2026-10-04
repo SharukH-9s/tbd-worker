@@ -46,5 +46,7 @@ typst-as-lib = "0.16"        # uses typst 0.15 internally
 typst-pdf = "0.15"           # same
 derive_typst_intoval = "0.8" # 0.8 targets typst 0.15 (matches typst-as-lib)
 
-# SMTP email client — builds MIME message, sends via Brevo (replaces Resend HTTP API)
-lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
+# Brevo HTTP API for email delivery (SMTP is blocked on Render free tier)
+# Port 443 HTTPS is always open; Brevo's transactional email REST API works fine.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+base64 = "0.22"

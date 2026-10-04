@@ -856,5 +856,70 @@ appropriate. If you ever need to tune it, use `lettre::transport::smtp::SmtpTran
 | `tbd-worker/templates/email_booking.html` | New file | Askama HTML template for email body |
 | `tbd-worker/templates/pdf_invoice.typ` | New file | Typst template for PDF invoice |
 | `tbd-backend/src/api/utils/tester.rs` | Verify only | Confirm no Gotenberg ping exists; worker keep-alive stays |
-| Render — Gotenberg service | Delete | Free up one free-tier service slot |
-| Render — tbd-worker env | Update | Swap 5 old vars for 5 new Brevo vars |
+| `Render — Gotenberg service` | Delete | Free up one free-tier service slot |
+| `Render — tbd-worker env` | Update | Swap 5 old vars for 5 new Brevo vars |
+
+---
+
+## 15. Current Implementation: Askama + Typst + Brevo HTTP REST API
+
+> **Status: Implemented & Verified in `tbd-worker`**
+
+### 15.1 Architectural Shift (Why HTTP REST API instead of Lettre SMTP)
+
+During live deployment and testing on Render free tier, the worker encountered:
+```
+SMTP transient error: Connection error: connection timed out
+```
+**Root Cause**: Render free tier actively blocks outbound connections on standard SMTP ports (`25`, `465`, `587`) for abuse prevention.
+
+**Solution**: Replaced the Lettre SMTP transport with **Brevo's transactional email REST API (v3)** via HTTP POST (`https://api.brevo.com/v3/smtp/email`).
+- Communicates over standard HTTPS port `443` (always open across cloud platforms, including Render free tier).
+- Uses `reqwest` with `rustls-tls` and `json`.
+- PDF invoice generated in-process via Typst is Base64 encoded and attached directly in the JSON payload.
+
+### 15.2 Active Stack & Dependencies (`Cargo.toml`)
+
+- **HTML Templating**: `askama = "0.12"` (compile-time checked Jinja2-style templates)
+- **PDF Generation**:
+  - `typst = "0.15"`
+  - `typst-as-lib = "0.16"`
+  - `typst-pdf = "0.15"`
+  - `derive_typst_intoval = "0.8"`
+- **Email Delivery**:
+  - `reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }`
+  - `base64 = "0.22"`
+  - *(Lettre was removed completely)*
+
+### 15.3 Core Workflow in `src/consumers/booking.rs`
+
+1. **`generate_invoice_pdf`**:
+   - Uses `typst-as-lib::TypstEngine` in-memory.
+   - Evaluates `templates/pdf_invoice.typ` with inputs bound via `derive_typst_intoval::IntoDict`.
+   - Produces raw `Vec<u8>` PDF bytes directly in-process with zero network hops.
+2. **`render_email_html`**:
+   - Renders `templates/email_booking.html` via Askama compile-time template into a `String`.
+3. **`send_booking_email`**:
+   - Encodes PDF bytes into Base64 using `general_purpose::STANDARD.encode(&pdf_bytes)`.
+   - Splits `config.email_from` into sender name and email.
+   - Posts a JSON body to `https://api.brevo.com/v3/smtp/email` with header `api-key: <BREVO_API_KEY>`.
+   - Maps 2xx to success, 4xx (except 429) to `ConsumerError::Permanent`, and 429/5xx/network drops to `ConsumerError::Transient` (triggering backoff retry).
+
+### 15.4 Configuration & Environment
+
+- **`WorkerConfig`** (`src/config.rs`):
+  ```rust
+  pub struct WorkerConfig {
+      pub amqp_url: String,
+      pub amqp_prefetch_count: u16,
+      pub brevo_api_key: String,
+      pub email_from: String,
+      pub http_client: reqwest::Client,
+      pub db: sqlx::PgPool,
+  }
+  ```
+- **Environment Variables**:
+  - `BREVO_API_KEY`: Brevo REST API key generated from **Brevo Dashboard → SMTP & API → API Keys** (starts with `xkeysib-...`, distinct from SMTP key).
+  - `EMAIL_FROM`: Verified sender, e.g. `Turf BD <no-reply@turfbd.com>`.
+  - Removed all `BREVO_SMTP_*` and `GOTENBERG_*` variables.
+
