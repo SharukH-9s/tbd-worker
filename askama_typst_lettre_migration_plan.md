@@ -883,7 +883,7 @@ SMTP transient error: Connection error: connection timed out
 - **HTML Templating**: `askama = "0.12"` (compile-time checked Jinja2-style templates)
 - **PDF Generation**:
   - `typst = "0.15"`
-  - `typst-as-lib = "0.16"`
+  - `typst-as-lib = { version = "0.16", features = ["typst-kit-fonts", "typst-kit-embed-fonts"] }` (loads embedded fonts from `typst-assets` + discovers system fonts via `TypstKitFontOptions`)
   - `typst-pdf = "0.15"`
   - `derive_typst_intoval = "0.8"`
 - **Email Delivery**:

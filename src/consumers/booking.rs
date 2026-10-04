@@ -469,9 +469,11 @@ fn generate_invoice_pdf(payload: &BookingCreatedData) -> Result<Vec<u8>, Consume
         is_partial: payload.is_partially_paid(),
     };
 
-    // Build the Typst engine with the embedded template source.
-    // `TypstEngine` handles font loading, World setup, and compilation internally.
-    let engine = TypstEngine::builder().main_file(TEMPLATE).build();
+    // Build the Typst engine with the embedded template source and fonts.
+    let engine = TypstEngine::builder()
+        .main_file(TEMPLATE)
+        .search_fonts_with(typst_as_lib::typst_kit_options::TypstKitFontOptions::default())
+        .build();
 
     // Compile the document, injecting `inputs` as sys.inputs
     let doc = engine.compile_with_input(inputs).output.map_err(|error| {
@@ -603,3 +605,34 @@ fn split_display_email(s: &str) -> (String, String) {
         (s.to_string(), s.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_pdf() {
+        let payload = BookingCreatedData {
+            booking_id: 1234,
+            user_email: "test@example.com".to_string(),
+            contact_name: Some("John Doe".to_string()),
+            turf_name: Some("Green Field".to_string()),
+            game_name: Some("Football 7v7".to_string()),
+            slot_start: "2026-10-05 18:00".to_string(),
+            amount: "1500".to_string(),
+            total_price: Some("1500".to_string()),
+            paid_amount: Some("500".to_string()),
+            due_amount: Some("1000".to_string()),
+            payment_status: Some("Partially_Paid".to_string()),
+        };
+
+        let pdf = generate_invoice_pdf(&payload).expect("PDF generation should succeed");
+        assert!(!pdf.is_empty(), "PDF output should not be empty");
+        assert!(
+            pdf.len() > 10_000,
+            "PDF should contain embedded font subsets and rendered text (got {} bytes)",
+            pdf.len()
+        );
+    }
+}
+

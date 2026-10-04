@@ -42,7 +42,7 @@ askama = "0.12"
 # In-process Typst PDF rendering (replaces Gotenberg HTTP sidecar)
 # All typst-* crates must share the same typst version (0.15.x)
 typst = "0.15"               # explicit dep so we can use typst::foundations::Dict
-typst-as-lib = "0.16"        # uses typst 0.15 internally
+typst-as-lib = { version = "0.16", features = ["typst-kit-fonts", "typst-kit-embed-fonts"] }
 typst-pdf = "0.15"           # same
 derive_typst_intoval = "0.8" # 0.8 targets typst 0.15 (matches typst-as-lib)
 

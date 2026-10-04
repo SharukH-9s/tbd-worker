@@ -7,7 +7,7 @@
 
 // ── Page & Typography ─────────────────────────────────────────────────────────
 #set page(margin: (x: 2cm, y: 2cm), paper: "a4")
-#set text(size: 11pt, fill: rgb("#1e293b"))  // uses Typst's default embedded font
+#set text(font: ("Inter", "Roboto", "Liberation Sans", "Segoe UI", "Arial", "Libertinus Serif"), size: 10.5pt, fill: rgb("#1e293b"))
 #set par(leading: 0.65em)
 
 // ── Convenience Aliases ───────────────────────────────────────────────────────
