@@ -3,6 +3,7 @@ mod consumers;
 pub mod error;
 
 use dotenvy::dotenv;
+use lettre::{transport::smtp::authentication::Credentials, AsyncSmtpTransport, Tokio1Executor};
 use std::env;
 
 #[tokio::main]
@@ -19,7 +20,6 @@ async fn main() {
 
     let app_env = env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
 
-    // Uses tracing_subscriber::fmt() convenience builder to construct a standalone FmtSubscriber.
     match app_env.as_str() {
         "production" => {
             tracing_subscriber::fmt()
@@ -45,7 +45,8 @@ async fn main() {
         Ok(listener) => {
             tracing::info!(port = %port, "Health check server bound successfully");
             tokio::spawn(async move {
-                let app = axum::Router::new().route("/healthz", axum::routing::get(|| async { "OK" }));
+                let app =
+                    axum::Router::new().route("/healthz", axum::routing::get(|| async { "OK" }));
                 if let Err(e) = axum::serve(listener, app).await {
                     tracing::error!(error = %e, "Health check server failed to run");
                 }
@@ -56,22 +57,10 @@ async fn main() {
         }
     }
 
-
-    // ── Read Required Config ───────────────────────────────────────────────
+    // ── Required Config ────────────────────────────────────────────────────────
     let amqp_url = env::var("AMQP_URL")
         .expect("AMQP_URL must be set")
         .trim()
-        .to_string();
-
-    let resend_api_key = env::var("RESEND_API_KEY")
-        .expect("RESEND_API_KEY must be set")
-        .trim()
-        .to_string();
-
-    let gotenberg_url = env::var("GOTENBERG_URL")
-        .expect("GOTENBERG_URL must be set")
-        .trim()
-        .trim_end_matches('/')
         .to_string();
 
     let database_url = env::var("DATABASE_URL")
@@ -79,26 +68,44 @@ async fn main() {
         .trim()
         .to_string();
 
-    // ── Read Optional / Tunable Config ────────────────────────────────────
-    let resend_from_email = env::var("RESEND_FROM_EMAIL")
-        .unwrap_or_else(|_| "TBD <onboarding@resend.dev>".to_string());
+    let brevo_smtp_user = env::var("BREVO_SMTP_USER")
+        .expect("BREVO_SMTP_USER must be set")
+        .trim()
+        .to_string();
 
-    let gotenberg_user = env::var("GOTENBERG_USER").ok();
-    let gotenberg_password = env::var("GOTENBERG_PASSWORD").ok();
+    let brevo_smtp_password = env::var("BREVO_SMTP_PASSWORD")
+        .expect("BREVO_SMTP_PASSWORD must be set")
+        .trim()
+        .to_string();
+
+    // ── Optional / Tunable Config ──────────────────────────────────────────────
+    let brevo_smtp_host =
+        env::var("BREVO_SMTP_HOST").unwrap_or_else(|_| "smtp-relay.brevo.com".to_string());
+
+    let brevo_smtp_port: u16 = env::var("BREVO_SMTP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(587);
+
+    let email_from =
+        env::var("EMAIL_FROM").unwrap_or_else(|_| "Turf BD <no-reply@turfbd.com>".to_string());
 
     let amqp_prefetch_count: u16 = env::var("AMQP_PREFETCH_COUNT")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-
-    let http_timeout_secs: u64 = env::var("HTTP_TIMEOUT_SECS")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
 
     let max_connections: u32 = env::var("DATABASE_MAX_CONNECTIONS")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
 
     let acquire_timeout_secs: u64 = env::var("DATABASE_ACQUIRE_TIMEOUT_SECS")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
 
-    // ── Connect to Neon (Postgres) with Pool Tuning ───────────────────────
+    // ── Connect to Neon (Postgres) ─────────────────────────────────────────────
     let db = sqlx::postgres::PgPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs))
@@ -108,29 +115,41 @@ async fn main() {
 
     tracing::info!("tbd-worker: connected to Neon (Postgres)");
 
-    // ── Build Shared HTTP Client ───────────────────────────────────────────
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(http_timeout_secs))
-        .build()
-        .expect("Failed to build HTTP client");
+    // ── Build Lettre SMTP Transport (Brevo) ────────────────────────────────────
+    // Uses STARTTLS on port 587. The transport wraps an Arc internally,
+    // so cloning WorkerConfig is cheap — no new connection is opened.
+    let creds = Credentials::new(brevo_smtp_user.clone(), brevo_smtp_password.clone());
 
-    // ── Build Config ───────────────────────────────────────────────────────
+    let mailer: AsyncSmtpTransport<Tokio1Executor> =
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&brevo_smtp_host)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to build SMTP transport for '{}': {}",
+                    brevo_smtp_host, e
+                )
+            })
+            .port(brevo_smtp_port)
+            .credentials(creds)
+            .build();
+
+    tracing::info!(
+        smtp_host = %brevo_smtp_host,
+        smtp_port = brevo_smtp_port,
+        "tbd-worker: Lettre SMTP transport configured (Brevo)"
+    );
+
+    // ── Build Shared Config ────────────────────────────────────────────────────
     let worker_config = config::WorkerConfig {
         amqp_url,
         amqp_prefetch_count,
-        resend_api_key,
-        resend_from_email,
-        gotenberg_url,
-        gotenberg_user,
-        gotenberg_password,
-        http_client,
+        email_from,
+        mailer,
         db,
     };
 
     tracing::info!("tbd-worker config loaded — connecting to CloudAMQP...");
 
-    // ── Start Consumer Loop ───────────────────────────────────────────────────
+    // ── Start Consumer Loop ────────────────────────────────────────────────────
     // This runs forever, reconnecting on drop.
     consumers::run_consumers(worker_config).await;
 }
-

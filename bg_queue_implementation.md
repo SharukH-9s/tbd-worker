@@ -9,7 +9,7 @@ This document is the finalized, production-ready specification and implementatio
 
 ```
 tbd-backend (Axum API)
-  ├── [Booking Handler] ── writes domain booking + outbox row atomically (in 1 DB transaction)
+  ├── [Payment Handler] ── updates the paid booking + writes outbox row atomically (in 1 DB transaction)
   │                                    ↓
   │                             Postgres (outbox table)
   │                                    ↑
@@ -128,11 +128,18 @@ The relay encapsulates domain payloads into a structured metadata envelope:
   "event_type": "BookingCreated",
   "timestamp": "2026-08-23T12:00:00.000Z",
   "payload": {
+    "outbox_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
     "booking_id": 42,
     "user_email": "user@example.com",
     "contact_name": "Alice Rahman",
-    "slot_start": "2026-08-25T18:00:00Z",
-    "amount": "1500.00"
+    "turf_name": "Dhanmondi Turf Arena",
+    "game_name": "5v5 Football Pitch A",
+    "slot_start": "2026-08-25T18:00:00+00:00",
+    "amount": "600.00",
+    "total_price": "2000.00",
+    "paid_amount": "600.00",
+    "due_amount": "1400.00",
+    "payment_status": "Partially_Paid"
   }
 }
 ```
@@ -144,7 +151,7 @@ Event types (PascalCase) are automatically normalized to dot-separated lower-cas
 
 ---
 
-## 4. `tbd-backend` — Outbox Relay Implementation
+## 4. `tbd-backend` — Outbox Relay & Producer Implementation
 
 The Outbox Relay runs as a dedicated `tokio::spawn` task in `TBD`.
 
@@ -169,8 +176,15 @@ The Outbox Relay runs as a dedicated `tokio::spawn` task in `TBD`.
    WHERE  id = $1;
    ```
 
-### 4.2 Code References
+### 4.2 Producer Single-Query Insert
+In [`BookingService::process_gateway_payment`](file:///e:/projects/anti/TBD/src/services/booking_service.rs), the outbox row is written inside the payment transaction in a single query:
+* Generates `outbox_id = Uuid::new_v4()` client-side.
+* Fetches parent `game` and `turf` via `GameRepository::find_by_id_tx` and `TurfRepository::find_by_id_tx` to embed complete venue details into the payload.
+* Executes a single atomic `INSERT INTO outbox (id, event_type, payload) VALUES ($1, 'BookingCreated', $2)`, completely eliminating the previous two-query (insert empty payload + update) pattern.
+
+### 4.3 Code References
 * Implementation: [`src/services/relay.rs`](file:///e:/projects/anti/TBD/src/services/relay.rs)
+* Producer: [`src/services/booking_service.rs`](file:///e:/projects/anti/TBD/src/services/booking_service.rs)
 * Registration: [`src/services/mod.rs`](file:///e:/projects/anti/TBD/src/services/mod.rs)
 * Spawn in main: [`src/main.rs`](file:///e:/projects/anti/TBD/src/main.rs#L198-L203)
 * Keep-alive ping: [`src/api/utils/tester.rs`](file:///e:/projects/anti/TBD/src/api/utils/tester.rs#L86-L137)
@@ -194,7 +208,44 @@ tbd-worker/
         └── booking.rs     # Topology setup, message ingestion, PDF & Email workflow
 ```
 
-### 5.2 Idempotency & Processing Sequence
+### 5.2 Consumer Data Contract (`BookingCreatedData`)
+`tbd-worker` deserializes the domain payload into `BookingCreatedData` with backwards-compatible defaults:
+
+```rust
+#[derive(Debug, Deserialize)]
+pub struct BookingCreatedData {
+    pub booking_id: i64,
+    pub user_email: String,
+    pub contact_name: Option<String>,
+    #[serde(default)]
+    pub turf_name: Option<String>,
+    #[serde(default)]
+    pub game_name: Option<String>,
+    pub slot_start: String,
+    pub amount: String,
+    #[serde(default)]
+    pub total_price: Option<String>,
+    #[serde(default)]
+    pub paid_amount: Option<String>,
+    #[serde(default)]
+    pub due_amount: Option<String>,
+    #[serde(default)]
+    pub payment_status: Option<String>,
+}
+```
+
+### 5.3 Invoice PDF & Email Templates
+1. **Gotenberg PDF Tax Invoice**:
+   * Uses a responsive, clean CSS-styled card rendered via Chromium.
+   * Displays **Turf BD** header, booking & invoice ID, customer information, venue name, pitch/game name, and match start time.
+   * **Financial breakdown**: Total slot price, amount paid online, and outstanding balance due at the venue.
+   * **Status Badge**: Highlights `Fully Paid` (green) or `Partially Paid (Advance)` (amber).
+   * **Dynamic Instructions**: If advance paid, clearly warns the customer to pay the remaining balance at the venue desk prior to the match.
+2. **Resend Email Notification**:
+   * **Subject**: Formatted as `Booking Confirmed #{id} — {turf_name} ({game_name})`.
+   * **Body**: Embeds customer name, venue/pitch summary, schedule, and payment status breakdown with the invoice PDF attached.
+
+### 5.4 Idempotency & Processing Sequence
 To eliminate data loss and prevent duplicate side-effects:
 
 ```
@@ -211,7 +262,7 @@ To eliminate data loss and prevent duplicate side-effects:
        ▼
 [3. In-Process Execution with Retry Loop]
        Attempt 1..3:
-         a. Generate PDF invoice via Gotenberg
+         a. Generate PDF invoice via Gotenberg (Chromium HTML-to-PDF)
          b. Base64-encode PDF
          c. Send email with attachment via Resend API
        ├─► (Transient Error) ─► Sleep backoff (2^attempt s) & Retry
@@ -219,16 +270,21 @@ To eliminate data loss and prevent duplicate side-effects:
        ▼
 [4. Commit on Success]
        INSERT INTO processed_jobs (outbox_id, consumer) VALUES ($1, 'booking') ON CONFLICT DO NOTHING
+       ├─► (DB Error) ────────► NACK (requeue: true) & Skip ACK
        ▼
-[5. Manual ACK]
+[5. Manual ACK — only after the completion record is saved]
        delivery.ack() ──► RabbitMQ permanently removes message
 ```
 
-### 5.3 Error Classification & DLQ Routing
+The backend emits `BookingCreated` when the payment flow successfully marks a
+booking as paid and its slot as booked. The payment update and outbox insert
+are committed together; the worker then sends the confirmation invoice/email.
+
+### 5.5 Error Classification & DLQ Routing
 
 | Error Scenario | Classification | Consumer Action | Reason |
 | :--- | :--- | :--- | :--- |
-| Email Sent + PDF Created | **Success** | `ack()` + write `processed_jobs` | Clean completion |
+| Email Sent + PDF Created + completion record saved | **Success** | `ack()` after writing `processed_jobs` | Clean completion |
 | Malformed JSON Body | **Permanent** | `nack(requeue: false)` | Corrupt payload; routes to DLQ |
 | Resend 4xx (401, 403, 422) | **Permanent** | `nack(requeue: false)` | Invalid API key or domain; routes to DLQ |
 | Gotenberg 4xx Client Error | **Permanent** | `nack(requeue: false)` | Invalid HTML payload; routes to DLQ |
@@ -236,6 +292,7 @@ To eliminate data loss and prevent duplicate side-effects:
 | Resend 5xx Server Error | **Transient** | Retry with backoff $\to$ `nack(requeue: false)` if maxed | Upstream outage recovery |
 | Network Timeout / Drop | **Transient** | Retry with backoff $\to$ `nack(requeue: false)` if maxed | Temporary network blip |
 | Postgres Idempotency Check Error | **Transient** | `nack(requeue: true)` | DB connection blip; safe to retry |
+| Postgres Completion Record Error | **Transient** | `nack(requeue: true)` | Do not ACK until `processed_jobs` is saved; prevents losing the message |
 
 ---
 

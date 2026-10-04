@@ -10,9 +10,6 @@ tokio = { version = "1", features = ["full"] }
 # AMQP client for consuming from CloudAMQP (RabbitMQ)
 lapin = "2"
 
-# HTTP client for calling Resend (email) and Gotenberg (PDF)
-reqwest = { version = "0.12", features = ["json", "multipart"] }
-
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -36,4 +33,18 @@ anyhow = "1"
 dotenvy = "0.15"
 futures = "0.3.33"
 axum = "0.8"
-base64 = "0.22"
+
+# ── NEW: Email + PDF Stack ────────────────────────────────────────────────────
+
+# Compile-time Jinja2-style HTML templates for email body
+askama = "0.12"
+
+# In-process Typst PDF rendering (replaces Gotenberg HTTP sidecar)
+# All typst-* crates must share the same typst version (0.15.x)
+typst = "0.15"               # explicit dep so we can use typst::foundations::Dict
+typst-as-lib = "0.16"        # uses typst 0.15 internally
+typst-pdf = "0.15"           # same
+derive_typst_intoval = "0.8" # 0.8 targets typst 0.15 (matches typst-as-lib)
+
+# SMTP email client — builds MIME message, sends via Brevo (replaces Resend HTTP API)
+lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }

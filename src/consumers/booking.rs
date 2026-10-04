@@ -1,6 +1,7 @@
 use crate::config::WorkerConfig;
 use crate::error::ConsumerError;
-use base64::{engine::general_purpose, Engine as _};
+use askama::Template;
+use derive_typst_intoval::{IntoDict, IntoValue};
 use futures::StreamExt;
 use lapin::{
     options::{
@@ -10,11 +11,19 @@ use lapin::{
     types::{AMQPValue, FieldTable},
     Channel, ExchangeKind,
 };
+use lettre::{
+    message::{header::ContentType, Attachment, MultiPart, SinglePart},
+    AsyncTransport, Message,
+};
 use serde::Deserialize;
+use typst::foundations::{Dict, IntoValue as _};
+use typst_as_lib::{TypstAsLibError, TypstEngine};
 use uuid::Uuid;
 
 const QUEUE_NAME: &str = "booking_jobs";
 const EXCHANGE_NAME: &str = "tbd.events";
+
+// ── AMQP Envelope & Domain Payload ───────────────────────────────────────────
 
 /// Standard event envelope published by the outbox relay.
 #[derive(Debug, Deserialize)]
@@ -90,7 +99,54 @@ impl BookingCreatedData {
     }
 }
 
-/// Ensure RabbitMQ topology (DLX, DLQ, Topic Exchange, Queue) exists idempotently before consuming.
+// ── Askama Email Template ─────────────────────────────────────────────────────
+
+/// Askama template — maps 1:1 to `templates/email_booking.html`.
+/// The template HTML is validated and parsed at compile time.
+/// `.render()` at runtime is near-zero cost (just string interpolation).
+#[derive(Template)]
+#[template(path = "email_booking.html")]
+struct BookingEmailTemplate<'a> {
+    booking_id: i64,
+    contact_name: &'a str,
+    turf_name: &'a str,
+    game_name: &'a str,
+    slot_start: &'a str,
+    paid_amount: &'a str,
+    due_amount: &'a str,
+    is_partially_paid: bool,
+}
+
+// ── Typst PDF Input Struct ────────────────────────────────────────────────────
+
+/// Data injected into the Typst template via sys.inputs.
+/// `derive_typst_intoval` generates the `IntoValue` + `IntoDict` impls
+/// so this struct can be passed directly to `TypstEngine::compile_with_input()`.
+#[derive(Debug, Clone, IntoValue, IntoDict)]
+struct InvoiceInputs {
+    booking_id: String,
+    contact_name: String,
+    user_email: String,
+    turf_name: String,
+    game_name: String,
+    slot_start: String,
+    total_price: String,
+    paid_amount: String,
+    due_amount: String,
+    payment_status: String,
+    is_partial: bool,
+}
+
+impl From<InvoiceInputs> for Dict {
+    fn from(v: InvoiceInputs) -> Self {
+        v.into_dict()
+    }
+}
+
+// ── AMQP Topology ────────────────────────────────────────────────────────────
+
+/// Ensure RabbitMQ topology (DLX, DLQ, Topic Exchange, Queue) exists
+/// idempotently before consuming. Identical to the relay's topology.
 async fn setup_booking_topology(ch: &Channel) -> Result<(), lapin::Error> {
     // 1. Declare DLX (Fanout)
     ch.exchange_declare(
@@ -164,6 +220,8 @@ async fn setup_booking_topology(ch: &Channel) -> Result<(), lapin::Error> {
 
     Ok(())
 }
+
+// ── Consumer Entry Point ──────────────────────────────────────────────────────
 
 /// Subscribe to 'booking_jobs' and process each message with manual ACK.
 pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
@@ -352,8 +410,7 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
                     error = ?e,
                     "Booking consumer: failure — NACKing WITHOUT requeue (routing to DLQ)"
                 );
-
-                // Requeue: false sends message to tbd.dlx / tbd.dlq
+                // requeue: false sends message to tbd.dlx / tbd.dlq
                 let _ = delivery
                     .nack(BasicNackOptions {
                         requeue: false,
@@ -367,363 +424,117 @@ pub async fn consume_booking_jobs(channel: Channel, config: WorkerConfig) {
     tracing::warn!("Booking consumer: stream ended — exiting");
 }
 
+// ── Job Orchestrator ──────────────────────────────────────────────────────────
+
 async fn process_booking_job(
     config: &WorkerConfig,
     payload: &BookingCreatedData,
 ) -> Result<(), ConsumerError> {
-    // 1. Generate PDF bytes via Gotenberg
-    let pdf_bytes = generate_invoice_pdf(config, payload).await?;
+    // Step 1: Render PDF bytes in-process via Typst (CPU-bound, sync)
+    let pdf_bytes = generate_invoice_pdf(payload)?;
 
-    // 2. Base64-encode the PDF bytes
-    let pdf_base64 = general_purpose::STANDARD.encode(&pdf_bytes);
+    // Step 2: Render email HTML via Askama (compile-time validated template)
+    let html_body = render_email_html(payload)?;
 
-    // 3. Send the email with the attached PDF
-    send_booking_email(config, payload, pdf_base64).await?;
+    // Step 3: Build MIME email and send via Lettre → Brevo SMTP
+    send_booking_email(config, payload, html_body, pdf_bytes).await?;
 
     Ok(())
 }
 
-async fn generate_invoice_pdf(
-    config: &WorkerConfig,
-    payload: &BookingCreatedData,
-) -> Result<Vec<u8>, ConsumerError> {
-    let status_badge_class = if payload.is_partially_paid() {
-        "status-partial"
-    } else {
-        "status-paid"
+// ── PDF Generation (Typst, in-process) ───────────────────────────────────────
+
+/// Renders the Typst invoice template in-process and returns raw PDF bytes.
+///
+/// The `.typ` template is embedded into the binary at compile-time via
+/// `include_str!`, so no disk read occurs at runtime and the binary is
+/// self-contained (no external template file needed on Render).
+///
+/// Errors are classified as `Permanent` because a broken template or
+/// invalid input will not fix itself on retry.
+fn generate_invoice_pdf(payload: &BookingCreatedData) -> Result<Vec<u8>, ConsumerError> {
+    // Embed the Typst template at compile-time — binary is fully self-contained.
+    static TEMPLATE: &str = include_str!("../../templates/pdf_invoice.typ");
+
+    // Build the input struct — derive_typst_intoval converts this to a typst Dict
+    // that becomes accessible as `inputs.field_name` inside the .typ file.
+    let inputs = InvoiceInputs {
+        booking_id: payload.booking_id.to_string(),
+        contact_name: payload.display_contact_name().to_string(),
+        user_email: payload.user_email.clone(),
+        turf_name: payload.display_turf_name().to_string(),
+        game_name: payload.display_game_name().to_string(),
+        slot_start: payload.slot_start.clone(),
+        total_price: payload.display_total_price().to_string(),
+        paid_amount: payload.display_paid_amount().to_string(),
+        due_amount: payload.display_due_amount().to_string(),
+        payment_status: payload.display_payment_status().to_string(),
+        is_partial: payload.is_partially_paid(),
     };
 
-    let due_section = if payload.is_partially_paid() {
-        format!(
-            r#"<tr class="due-row">
-                <td colspan="2"><strong>Amount Due at Venue</strong></td>
-                <td class="text-right text-due"><strong>BDT {}</strong></td>
-            </tr>"#,
-            payload.display_due_amount()
-        )
-    } else {
-        String::new()
-    };
+    // Build the Typst engine with the embedded template source.
+    // `TypstEngine` handles font loading, World setup, and compilation internally.
+    let engine = TypstEngine::builder().main_file(TEMPLATE).build();
 
-    let payment_note = if payload.is_partially_paid() {
-        format!(
-            r#"<div class="notice-card warning">
-                <strong>⚠️ Advance Payment Acknowledged:</strong> BDT {} paid online. Please settle the remaining balance of <strong>BDT {}</strong> at the venue desk prior to match kickoff.
-            </div>"#,
-            payload.display_paid_amount(),
-            payload.display_due_amount()
-        )
-    } else {
-        r#"<div class="notice-card success">
-            <strong>✅ Paid in Full:</strong> This reservation has been completely settled online. Please present this invoice at the venue for direct entry.
-        </div>"#.to_string()
-    };
-
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Invoice #{}</title>
-  <style>
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      color: #1e293b;
-      background-color: #ffffff;
-      padding: 40px;
-      font-size: 14px;
-      line-height: 1.5;
-    }}
-    .invoice-card {{
-      max-width: 680px;
-      margin: 0 auto;
-      border: 1px solid #e2e8f0;
-      border-radius: 12px;
-      padding: 36px;
-      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
-    }}
-    .header {{
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      border-bottom: 2px solid #0f172a;
-      padding-bottom: 20px;
-      margin-bottom: 24px;
-    }}
-    .brand {{
-      font-size: 26px;
-      font-weight: 800;
-      letter-spacing: -0.5px;
-      color: #0f172a;
-    }}
-    .brand span {{ color: #10b981; }}
-    .invoice-title {{
-      text-align: right;
-    }}
-    .invoice-title h2 {{
-      font-size: 20px;
-      color: #334155;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-    }}
-    .invoice-title p {{
-      color: #64748b;
-      font-size: 13px;
-    }}
-    .grid-info {{
-      display: flex;
-      justify-content: space-between;
-      margin-bottom: 24px;
-      gap: 20px;
-    }}
-    .info-block h4 {{
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: #64748b;
-      margin-bottom: 6px;
-    }}
-    .info-block p {{
-      font-size: 14px;
-      font-weight: 600;
-      color: #1e293b;
-    }}
-    .info-block span {{
-      color: #475569;
-      font-weight: 400;
-      display: block;
-    }}
-    .badge {{
-      display: inline-block;
-      padding: 4px 10px;
-      border-radius: 9999px;
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }}
-    .status-paid {{
-      background-color: #ecfdf5;
-      color: #059669;
-      border: 1px solid #a7f3d0;
-    }}
-    .status-partial {{
-      background-color: #fffbeb;
-      color: #d97706;
-      border: 1px solid #fde68a;
-    }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      margin-bottom: 24px;
-    }}
-    th {{
-      background-color: #f8fafc;
-      color: #475569;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      text-align: left;
-      padding: 12px 14px;
-      border-top: 1px solid #e2e8f0;
-      border-bottom: 1px solid #e2e8f0;
-    }}
-    td {{
-      padding: 14px;
-      border-bottom: 1px solid #f1f5f9;
-      color: #334155;
-    }}
-    .text-right {{ text-align: right; }}
-    .text-due {{ color: #dc2626; }}
-    .text-paid {{ color: #059669; }}
-    .total-row td {{
-      font-weight: 700;
-      background-color: #f8fafc;
-      border-top: 2px solid #e2e8f0;
-    }}
-    .due-row td {{
-      background-color: #fef2f2;
-      border-top: 1px solid #fecaca;
-    }}
-    .notice-card {{
-      padding: 14px 18px;
-      border-radius: 8px;
-      font-size: 13px;
-      margin-bottom: 24px;
-      line-height: 1.6;
-    }}
-    .notice-card.warning {{
-      background-color: #fffbeb;
-      border: 1px solid #fef3c7;
-      color: #92400e;
-    }}
-    .notice-card.success {{
-      background-color: #ecfdf5;
-      border: 1px solid #d1fae5;
-      color: #065f46;
-    }}
-    .footer {{
-      border-top: 1px solid #e2e8f0;
-      padding-top: 18px;
-      text-align: center;
-      color: #94a3b8;
-      font-size: 12px;
-    }}
-  </style>
-</head>
-<body>
-  <div class="invoice-card">
-    <div class="header">
-      <div class="brand">TURF<span>BD</span></div>
-      <div class="invoice-title">
-        <h2>Tax Invoice</h2>
-        <p>Booking #{}</p>
-      </div>
-    </div>
-
-    <div class="grid-info">
-      <div class="info-block">
-        <h4>Customer Details</h4>
-        <p>{}</p>
-        <span>{}</span>
-      </div>
-      <div class="info-block">
-        <h4>Venue & Pitch</h4>
-        <p>{}</p>
-        <span>{}</span>
-      </div>
-      <div class="info-block text-right">
-        <h4>Match Schedule</h4>
-        <p>{}</p>
-        <span style="margin-top: 6px;"><span class="badge {}">{}</span></span>
-      </div>
-    </div>
-
-    <table>
-      <thead>
-        <tr>
-          <th>Description</th>
-          <th>Rate / Unit</th>
-          <th class="text-right">Amount</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>
-            <strong>Slot Reservation</strong><br>
-            <span style="color: #64748b; font-size: 12px;">{} &bull; {}</span>
-          </td>
-          <td>1 Match Slot</td>
-          <td class="text-right">BDT {}</td>
-        </tr>
-        <tr class="total-row">
-          <td colspan="2"><strong>Total Slot Price</strong></td>
-          <td class="text-right"><strong>BDT {}</strong></td>
-        </tr>
-        <tr>
-          <td colspan="2"><span class="text-paid">Amount Paid Online</span></td>
-          <td class="text-right text-paid"><strong>BDT {}</strong></td>
-        </tr>
-        {}
-      </tbody>
-    </table>
-
-    {}
-
-    <div class="footer">
-      Thank you for playing with Turf BD &bull; For questions, contact support@turfbd.com
-    </div>
-  </div>
-</body>
-</html>"#,
-        payload.booking_id,
-        payload.booking_id,
-        payload.display_contact_name(),
-        payload.user_email,
-        payload.display_turf_name(),
-        payload.display_game_name(),
-        payload.slot_start,
-        status_badge_class,
-        payload.display_payment_status(),
-        payload.display_turf_name(),
-        payload.display_game_name(),
-        payload.display_total_price(),
-        payload.display_total_price(),
-        payload.display_paid_amount(),
-        due_section,
-        payment_note
-    );
-
-    let form = reqwest::multipart::Form::new().part(
-        "files",
-        reqwest::multipart::Part::bytes(html.into_bytes())
-            .file_name("index.html")
-            .mime_str("text/html")
-            .map_err(|e| ConsumerError::Transient(e.into()))?,
-    );
-
-    let mut request = config
-        .http_client
-        .post(format!(
-            "{}/forms/chromium/convert/html",
-            config.gotenberg_url
-        ))
-        .multipart(form);
-
-    // Only attach Basic Auth if credentials are configured.
-    // Leave unset if your Gotenberg instance has no auth (avoids proxy 401/502).
-    if let (Some(user), Some(pass)) = (&config.gotenberg_user, &config.gotenberg_password) {
-        request = request.basic_auth(user, Some(pass));
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|e| ConsumerError::Transient(e.into()))?;
-
-    // Gotenberg error handling
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        let text = if text.len() > 300 {
-            format!(
-                "{}... [truncated, total {} bytes]",
-                &text[..300],
-                text.len()
-            )
-        } else {
-            text
+    // Compile the document, injecting `inputs` as sys.inputs
+    let doc = engine.compile_with_input(inputs).output.map_err(|error| {
+        let message = match error {
+            TypstAsLibError::TypstSource(diagnostics) => diagnostics
+                .iter()
+                .map(|diagnostic| format!("{:?}", diagnostic.message))
+                .collect::<Vec<_>>()
+                .join("; "),
+            other => other.to_string(),
         };
+        ConsumerError::Permanent(format!("Typst compile error(s): {message}"))
+    })?;
 
-        if status.is_client_error() && status.as_u16() != 429 {
-            return Err(ConsumerError::Permanent(format!(
-                "Gotenberg permanent error: {} — {}",
-                status, text
-            )));
-        }
+    // Export to PDF bytes (typst-pdf)
+    let pdf_bytes = typst_pdf::pdf(&doc, &typst_pdf::PdfOptions::default())
+        .map_err(|e| ConsumerError::Permanent(format!("Typst PDF export error: {:?}", e)))?;
 
-        return Err(ConsumerError::Transient(anyhow::anyhow!(
-            "Gotenberg transient error: {} — {}",
-            status,
-            text
-        )));
-    }
-
-    let pdf_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| ConsumerError::Transient(e.into()))?
-        .to_vec();
+    tracing::debug!(
+        booking_id = payload.booking_id,
+        pdf_size_bytes = pdf_bytes.len(),
+        "PDF invoice generated"
+    );
 
     Ok(pdf_bytes)
 }
 
+// ── Email HTML Rendering (Askama) ─────────────────────────────────────────────
+
+/// Renders the Askama HTML email template to a `String`.
+/// The template is validated at compile-time; rendering is near-zero cost.
+fn render_email_html(payload: &BookingCreatedData) -> Result<String, ConsumerError> {
+    let tmpl = BookingEmailTemplate {
+        booking_id: payload.booking_id,
+        contact_name: payload.display_contact_name(),
+        turf_name: payload.display_turf_name(),
+        game_name: payload.display_game_name(),
+        slot_start: &payload.slot_start,
+        paid_amount: payload.display_paid_amount(),
+        due_amount: payload.display_due_amount(),
+        is_partially_paid: payload.is_partially_paid(),
+    };
+
+    tmpl.render()
+        .map_err(|e| ConsumerError::Permanent(format!("Askama template render error: {}", e)))
+}
+
+// ── Email Sending (Lettre → Brevo SMTP) ──────────────────────────────────────
+
+/// Builds a MIME multipart email (HTML body + PDF attachment) and sends it
+/// via Lettre through the pre-configured Brevo SMTP transport.
+///
+/// No base64 encoding needed — Lettre handles binary attachment encoding internally.
 async fn send_booking_email(
     config: &WorkerConfig,
     payload: &BookingCreatedData,
-    pdf_base64: String,
+    html_body: String,
+    pdf_bytes: Vec<u8>,
 ) -> Result<(), ConsumerError> {
+    // Subject line
     let subject = format!(
         "Booking Confirmed #{} — {} ({})",
         payload.booking_id,
@@ -731,113 +542,72 @@ async fn send_booking_email(
         payload.display_game_name()
     );
 
-    let payment_summary = if payload.is_partially_paid() {
-        format!(
-            r#"<div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 14px; margin: 16px 0;">
-                <p style="margin: 0; color: #92400e; font-weight: bold;">⚠️ Advance Payment Confirmed</p>
-                <p style="margin: 6px 0 0 0; color: #b45309; font-size: 14px;">
-                    Amount Paid: <strong>BDT {}</strong><br />
-                    Amount Due at Turf: <strong style="color: #dc2626;">BDT {}</strong>
-                </p>
-            </div>"#,
-            payload.display_paid_amount(),
-            payload.display_due_amount()
+    // PDF attachment — Lettre accepts raw bytes directly, no base64 needed
+    let attachment_filename = format!("invoice-{}.pdf", payload.booking_id);
+    let pdf_content_type = ContentType::parse("application/pdf").unwrap();
+    let attachment = Attachment::new(attachment_filename).body(pdf_bytes, pdf_content_type);
+
+    // Parse RFC 5321 From/To mailboxes
+    let from_addr = config
+        .email_from
+        .parse::<lettre::message::Mailbox>()
+        .map_err(|e| {
+            ConsumerError::Permanent(format!(
+                "Invalid FROM address '{}': {}",
+                config.email_from, e
+            ))
+        })?;
+
+    let to_addr = payload
+        .user_email
+        .parse::<lettre::message::Mailbox>()
+        .map_err(|e| {
+            ConsumerError::Permanent(format!(
+                "Invalid TO address '{}': {}",
+                payload.user_email, e
+            ))
+        })?;
+
+    // Build MIME message:
+    //   multipart/mixed
+    //     └── text/html        ← rendered by Askama
+    //     └── application/pdf  ← invoice rendered by Typst
+    let email = Message::builder()
+        .from(from_addr)
+        .to(to_addr)
+        .subject(subject)
+        .multipart(
+            MultiPart::mixed()
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_HTML)
+                        .body(html_body),
+                )
+                .singlepart(attachment),
         )
-    } else {
-        format!(
-            r#"<div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 14px; margin: 16px 0;">
-                <p style="margin: 0; color: #065f46; font-weight: bold;">✅ Payment Complete</p>
-                <p style="margin: 6px 0 0 0; color: #047857; font-size: 14px;">Total Paid: <strong>BDT {}</strong> (Fully Paid)</p>
-            </div>"#,
-            payload.display_paid_amount()
-        )
-    };
+        .map_err(|e| ConsumerError::Permanent(format!("Failed to build MIME message: {}", e)))?;
 
-    let html_content = format!(
-        r#"<!DOCTYPE html>
-<html>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #1e293b; line-height: 1.6; max-width: 600px; margin: 0 auto; padding: 20px;">
-    <h2 style="color: #0f172a; margin-bottom: 8px;">Your Booking is Confirmed!</h2>
-    <p>Hi <strong>{}</strong>,</p>
-    <p>Great news! Your slot reservation has been successfully confirmed.</p>
-    
-    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; margin: 16px 0;">
-        <p style="margin: 0 0 8px 0;"><strong>Booking ID:</strong> #{}</p>
-        <p style="margin: 0 0 8px 0;"><strong>Venue:</strong> {}</p>
-        <p style="margin: 0 0 8px 0;"><strong>Pitch / Game:</strong> {}</p>
-        <p style="margin: 0;"><strong>Match Schedule:</strong> {}</p>
-    </div>
-
-    {}
-
-    <p style="color: #475569; font-size: 14px;">
-        Your official tax invoice has been generated and attached as a PDF (<strong>invoice-{}.pdf</strong>).
-    </p>
-    
-    <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 24px 0;" />
-    <p style="font-size: 12px; color: #94a3b8; text-align: center;">
-        Turf BD &bull; Instant Sports Booking
-    </p>
-</body>
-</html>"#,
-        payload.display_contact_name(),
-        payload.booking_id,
-        payload.display_turf_name(),
-        payload.display_game_name(),
-        payload.slot_start,
-        payment_summary,
-        payload.booking_id
-    );
-
-    let body = serde_json::json!({
-        "from": config.resend_from_email.as_str(),
-        "to": [payload.user_email],
-        "subject": subject,
-        "html": html_content,
-        "attachments": [
-            {
-                "filename": format!("invoice-{}.pdf", payload.booking_id),
-                "content": pdf_base64
-            }
-        ]
-    });
-
-    let response = config
-        .http_client
-        .post("https://api.resend.com/emails")
-        .header("Authorization", format!("Bearer {}", config.resend_api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| ConsumerError::Transient(e.into()))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        let text = if text.len() > 300 {
-            format!(
-                "{}... [truncated, total {} bytes]",
-                &text[..300],
-                text.len()
-            )
+    // Send via Brevo SMTP using the pre-built Lettre transport
+    config.mailer.send(email).await.map_err(|e| {
+        let msg = e.to_string();
+        // SMTP 5xx auth / mailbox errors won't fix on retry → Permanent
+        // Connection drops, 421 (service unavailable), timeouts → Transient
+        if msg.contains("535")
+            || msg.contains("550")
+            || msg.contains("553")
+            || msg.to_lowercase().contains("authentication")
+        {
+            ConsumerError::Permanent(format!("SMTP permanent error: {}", msg))
         } else {
-            text
-        };
-
-        if status.is_client_error() && status.as_u16() != 429 {
-            return Err(ConsumerError::Permanent(format!(
-                "Resend API permanent error: {} — {}",
-                status, text
-            )));
+            ConsumerError::Transient(anyhow::anyhow!("SMTP transient error: {}", msg))
         }
+    })?;
 
-        return Err(ConsumerError::Transient(anyhow::anyhow!(
-            "Resend API transient error: {} — {}",
-            status,
-            text
-        )));
-    }
+    tracing::info!(
+        booking_id = payload.booking_id,
+        recipient = %payload.user_email,
+        "Booking consumer: confirmation email dispatched via Brevo SMTP"
+    );
 
     Ok(())
 }
